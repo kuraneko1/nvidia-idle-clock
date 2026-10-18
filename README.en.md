@@ -5,6 +5,7 @@ English | [日本語](README.md)
 A systemd daemon for NVIDIA GPUs that park at a high clock and burn 36–45W while idle
 as soon as anything sits in VRAM. It clamps the clock ceiling with `nvidia-smi -lgc`
 while idle, and releases it the moment load appears.
+It runs **one independent instance per GPU**, so each card can have its own settings.
 
 | Tesla V100-PCIE-32GB (3.6GiB in VRAM) | Before | After |
 |---|---|---|
@@ -23,17 +24,46 @@ while idle, and releases it the moment load appears.
 ```bash
 git clone https://github.com/kuraneko1/nvidia-idle-clock.git
 cd nvidia-idle-clock
-sudo ./install.sh
+sudo ./install.sh          # one instance per detected GPU
+sudo ./install.sh 0 1      # pick GPUs explicitly
 ```
 
 Manual:
 
 ```bash
-sudo install -m 0755 nvidia-idle-clock         /usr/local/sbin/nvidia-idle-clock
-sudo install -m 0644 nvidia-idle-clock.service /etc/systemd/system/nvidia-idle-clock.service
+sudo install -m 0755 nvidia-idle-clock          /usr/local/sbin/nvidia-idle-clock
+sudo install -m 0644 nvidia-idle-clock@.service /etc/systemd/system/nvidia-idle-clock@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nvidia-idle-clock.service
+sudo systemctl enable --now nvidia-idle-clock@0.service   # GPU 0
+sudo systemctl enable --now nvidia-idle-clock@1.service   # GPU 1
 ```
+
+## Per-GPU assignment
+
+The instance name is the target GPU (`nvidia-smi` index).
+To assign an instance to an arbitrary GPU, or to give one GPU different settings, use a drop-in:
+
+```bash
+sudo systemctl edit nvidia-idle-clock@0.service
+```
+
+```ini
+[Service]
+Environment=GPU=2            # assign to another GPU
+Environment=IDLE_CAP=555     # relax the clamp for this GPU only
+Environment=IDLE_SECONDS=120
+```
+
+```bash
+sudo systemctl restart nvidia-idle-clock@0.service
+```
+
+Example:
+
+| Instance | GPU | Notes |
+|---|---|---|
+| `nvidia-idle-clock@0.service` | 0 | default (`IDLE_CAP=135`) |
+| `nvidia-idle-clock@1.service` | 1 | drop-in with `IDLE_SECONDS=120`, etc. |
 
 ## Uninstall
 
@@ -45,8 +75,8 @@ sudo ./uninstall.sh
 Manual:
 
 ```bash
-sudo systemctl disable --now nvidia-idle-clock.service
-sudo rm -f /etc/systemd/system/nvidia-idle-clock.service /usr/local/sbin/nvidia-idle-clock
+sudo systemctl disable --now 'nvidia-idle-clock@*'
+sudo rm -f /etc/systemd/system/nvidia-idle-clock@.service /usr/local/sbin/nvidia-idle-clock
 sudo systemctl daemon-reload
 for g in $(nvidia-smi --query-gpu=index --format=csv,noheader); do sudo nvidia-smi -i "$g" -rgc; done
 ```
@@ -77,19 +107,19 @@ index, name, clocks.current.graphics [MHz], power.draw [W]
 0, Tesla V100-PCIE-32GB, 135 MHz, 24.94 W
 1, Tesla PG500-216,       135 MHz, 27.67 W
 
-$ journalctl -u nvidia-idle-clock -o cat
-01:29:29 開始 gpu=0,1 cap=135-135MHz idle=30s sample=200ms skip_if_low=1
-01:30:04 gpu0 アイドル 30s 継続 (1380MHz): 135-135MHz にクランプ
-01:32:10 gpu1 活動検出 (util=27%): ロック解除
+$ journalctl -u nvidia-idle-clock@0 -o cat
+01:41:02 開始 gpu=0 cap=135-135MHz idle=30s sample=200ms skip_if_low=1
+01:41:37 gpu0 アイドル 30s 継続 (1380MHz): 135-135MHz にクランプ
+01:44:10 gpu0 活動検出 (util=58%): ロック解除
 ```
 
 ## Configuration
 
-Override with `Environment=` in the unit:
+Set `Environment=` per instance. `%i` (the instance name) is the default GPU.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GPU` | `0` | Target GPU (nvidia-smi index, comma-separated) |
+| `GPU` | `%i` | Target GPU (nvidia-smi index, comma-separated) |
 | `IDLE_CAP` | `135` | Clock ceiling clamped to while idle (MHz) |
 | `MIN_CLK` | `135` | Clock floor (MHz) |
 | `IDLE_SECONDS` | `30` | Idle seconds before clamping |
@@ -98,17 +128,15 @@ Override with `Environment=` in the unit:
 | `REASSERT_SECONDS` | `30` | Re-apply interval for the clamp (s) |
 | `SKIP_IF_LOW` | `1` | Do not clamp GPUs already idling at a low clock |
 
-```bash
-sudo systemctl edit nvidia-idle-clock.service
-sudo systemctl restart nvidia-idle-clock.service
-```
+A non-existent index in `GPU` is dropped with a warning; if none remain, startup fails.
 
 ## Behaviour
 
-- Polls target GPU utilization every `SAMPLE_MS`
+- Polls target GPU utilization every `SAMPLE_MS` (each instance independent)
 - `IDLE_SECONDS` idle → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
 - Utilization > `UTIL_THRESHOLD` → immediate `-rgc`
 - With `SKIP_IF_LOW=1`, already-low GPUs are left alone (clamping an empty GPU costs +0.7–2W)
+- Reconnects 2s after the utilization stream drops
 - Always runs `-rgc` on exit
 
 ## Notes

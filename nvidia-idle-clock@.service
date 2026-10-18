@@ -1,0 +1,26 @@
+[Unit]
+Description=Idle clock clamp for NVIDIA GPU %i (idle power saving)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# インスタンス名がそのまま対象 GPU (nvidia-smi index) になる。
+#   nvidia-idle-clock@0.service  -> GPU 0
+#   nvidia-idle-clock@1.service  -> GPU 1
+# 任意の GPU への割り当てや GPU ごとの個別設定は drop-in で上書きする:
+#   sudo systemctl edit nvidia-idle-clock@0.service
+#     [Service]
+#     Environment=GPU=2            # 別の GPU に割り当てる
+#     Environment=IDLE_CAP=555     # この GPU だけ上限を緩める
+#     Environment=IDLE_SECONDS=120
+Environment=GPU=%i
+Environment=IDLE_CAP=135
+Environment=IDLE_SECONDS=30
+ExecStart=/usr/local/sbin/nvidia-idle-clock
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target
