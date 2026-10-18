@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# nvidia-idle-clock
+# 対象GPUが一定時間アイドルなら -lgc でクロック上限を絞って待機電力を削減し、
+# 利用が始まったら即座に解除する。
+# V100 では NvAPI の PState 強制が一切効かない(fallback=0 で全PStateが NVAPI_ERROR)
+# ため、クロック範囲ロックで代用している。
+# 実測: クランプ中は計算0.089倍/帯域0.12-0.19倍だが、解除で完全に元に戻る
+#       (SGEMM 12.36TFLOP/s, DtoD 1024GB/s が誤差0.01%で復帰)。
+# SKIP_IF_LOW=1 では、ドライバが既に十分低いクロックでアイドルしているGPU
+# （VRAMが空の個体など）にはクランプを当てない。当てると逆に +0.7〜2W 増えるため。
+set -uo pipefail
+
+GPU="${GPU:-0}"                        # 対象GPU (nvidia-smi index, カンマ区切り可)
+IDLE_CAP="${IDLE_CAP:-135}"            # 待機時にクランプする上限クロック MHz
+MIN_CLK="${MIN_CLK:-135}"              # 下限 (V100の最小は135)
+IDLE_SECONDS="${IDLE_SECONDS:-30}"     # この秒数アイドルが続いたらクランプ
+SAMPLE_MS="${SAMPLE_MS:-200}"          # 利用率サンプリング間隔 ms
+UTIL_THRESHOLD="${UTIL_THRESHOLD:-0}"  # これ以下の利用率をアイドルとみなす %
+REASSERT_SECONDS="${REASSERT_SECONDS:-30}" # クランプ再適用の間隔 s
+SKIP_IF_LOW="${SKIP_IF_LOW:-1}"        # 既に低クロックならクランプしない
+
+NVSMI=/usr/bin/nvidia-smi
+IDS="${GPU// /}"
+IDLIST="${IDS//,/ }"
+
+log() { echo "$(date '+%F %T') $*"; }
+
+unlock_all() { for g in $IDLIST; do "$NVSMI" -i "$g" -rgc >/dev/null 2>&1; done; }
+
+cleanup() {
+  trap - INT TERM EXIT
+  unlock_all
+  log "終了: 全GPUのクロックロックを解除"
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+log "開始 gpu=$IDS cap=${MIN_CLK}-${IDLE_CAP}MHz idle=${IDLE_SECONDS}s sample=${SAMPLE_MS}ms skip_if_low=$SKIP_IF_LOW"
+unlock_all
+
+declare -A LOCKED=() IDLE=() ASSERTED=()
+for g in $IDLIST; do LOCKED[$g]=0; IDLE[$g]=0; ASSERTED[$g]=0; done
+
+while IFS= read -r line; do
+  idx="${line%%,*}"; util="${line#*,}"
+  idx="${idx//[^0-9]/}"; util="${util//[^0-9]/}"
+  if [ -z "$idx" ] || [ -z "$util" ]; then continue; fi
+  if [ -z "${LOCKED[$idx]+x}" ]; then continue; fi
+
+  if [ "$util" -gt "$UTIL_THRESHOLD" ]; then
+    if [ "${LOCKED[$idx]}" -eq 1 ]; then
+      if "$NVSMI" -i "$idx" -rgc >/dev/null 2>&1; then LOCKED[$idx]=0; fi
+      log "gpu$idx 活動検出 (util=${util}%): ロック解除"
+    fi
+    IDLE[$idx]=0; ASSERTED[$idx]=0
+    continue
+  fi
+
+  IDLE[$idx]=$(( ${IDLE[$idx]} + SAMPLE_MS ))
+
+  if [ "${LOCKED[$idx]}" -eq 1 ]; then
+    ASSERTED[$idx]=$(( ${ASSERTED[$idx]} + SAMPLE_MS ))
+    if [ "${ASSERTED[$idx]}" -ge $(( REASSERT_SECONDS * 1000 )) ]; then
+      "$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" >/dev/null 2>&1
+      ASSERTED[$idx]=0
+    fi
+    continue
+  fi
+
+  if [ "${IDLE[$idx]}" -lt $(( IDLE_SECONDS * 1000 )) ]; then continue; fi
+
+  cur=""
+  if [ "$SKIP_IF_LOW" = "1" ]; then
+    cur=$("$NVSMI" -i "$idx" --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null)
+    cur="${cur//[^0-9]/}"
+  fi
+  if [ "$SKIP_IF_LOW" = "1" ] && [ -n "$cur" ] && [ "$cur" -le "$IDLE_CAP" ]; then
+    IDLE[$idx]=0                      # ドライバが既に十分低い -> 何もしない
+    continue
+  fi
+  if "$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" >/dev/null 2>&1; then
+    LOCKED[$idx]=1; ASSERTED[$idx]=0
+    log "gpu$idx アイドル ${IDLE_SECONDS}s 継続 (${cur:-?}MHz): ${MIN_CLK}-${IDLE_CAP}MHz にクランプ"
+  fi
+done < <(stdbuf -oL "$NVSMI" -i "$IDS" --query-gpu=index,utilization.gpu --format=csv,noheader,nounits --loop-ms="$SAMPLE_MS" 2>/dev/null)
+
+log "利用率ストリームが終了しました"
