@@ -1,0 +1,4 @@
+*.pdf
+orch-status/
+mizuho*/
+__pycache__/
