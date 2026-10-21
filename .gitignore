@@ -1,12 +1,27 @@
-# このディレクトリは他プロジェクトと共用のため、追跡対象を明示的に限定する
+# このディレクトリは他プロジェクトと共用のため、追跡対象をホワイトリストで明示する。
+# A denylist cannot be used here: the checkout lives in a directory that also
+# holds unrelated private projects, and "ignore everything except what we ship"
+# is the only way to keep those files out of `git status` / `git add .`.
+#
+# 新しいファイルやディレクトリを追加するときは、下に `!` の行を足す。
+# To ship a new path, add a matching `!` entry below. Directories need a
+# trailing slash (`!/docs/`); unignoring the directory unignores everything
+# inside it, so no extra glob is needed. See CONTRIBUTING.md.
 /*
 !/.gitignore
+!/.editorconfig
 !/LICENSE
 !/README.md
 !/README.en.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
 !/install.sh
 !/uninstall.sh
 !/nvidia-idle-clock
 !/nvidia-idle-clock@.service
+!/.github/
+!/tests/
+!/docs/
 !/img/
 !/img/*.png
