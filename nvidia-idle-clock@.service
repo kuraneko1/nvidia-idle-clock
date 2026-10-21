@@ -28,14 +28,14 @@ StartLimitBurst=30
 
 [Service]
 Type=simple
-# インスタンス名がそのまま対象 GPU (nvidia-smi index) になる。
+# The instance name is used directly as the target GPU (nvidia-smi index):
 #   nvidia-idle-clock@0.service  -> GPU 0
 #   nvidia-idle-clock@1.service  -> GPU 1
-# 任意の GPU への割り当てや GPU ごとの個別設定は drop-in で上書きする:
+# Assign a different GPU, or override settings for one GPU, with a drop-in:
 #   sudo systemctl edit nvidia-idle-clock@0.service
 #     [Service]
-#     Environment=GPU=2            # 別の GPU に割り当てる
-#     Environment=IDLE_CAP=555     # この GPU だけ上限を緩める
+#     Environment=GPU=2            # serve another GPU
+#     Environment=IDLE_CAP=555     # relax the cap for this GPU only
 #     Environment=IDLE_SECONDS=120
 Environment=GPU=%i
 Environment=IDLE_CAP=135
