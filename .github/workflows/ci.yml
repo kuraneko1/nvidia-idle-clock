@@ -1,0 +1,65 @@
+name: CI
+
+# Only the project's own branch matters: main is protected by review, and a PR
+# from a fork should still get the same checks as a branch in this repository.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# The workflow only reads the checkout; nothing here needs write access.
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: ShellCheck, syntax, unit and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure shellcheck is installed
+        run: |
+          # The runner image ships shellcheck, but do not depend on that: an
+          # image bump must not silently skip the lint step.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+
+      - name: ShellCheck
+        # Warnings and above; `-s bash` because the shebangs are not enough to
+        # pick up bash-only constructs consistently.
+        run: shellcheck -s bash -S warning nvidia-idle-clock install.sh uninstall.sh
+
+      - name: Bash syntax check
+        run: |
+          for f in nvidia-idle-clock install.sh uninstall.sh; do
+            bash -n "$f"
+            echo "bash -n: $f ok"
+          done
+
+      - name: Verify systemd unit
+        run: |
+          # The shipped unit is a template, and systemd-analyze only accepts a
+          # template under an instance name, so verify a copy named @0.
+          # verify() also resolves ExecStart against the host, hence the
+          # install: without it verify fails with "Command
+          # /usr/local/sbin/nvidia-idle-clock is not executable".
+          mkdir -p "$RUNNER_TEMP/unit"
+          cp nvidia-idle-clock@.service "$RUNNER_TEMP/unit/nvidia-idle-clock@0.service"
+          sudo install -D -m 0755 ./nvidia-idle-clock /usr/local/sbin/nvidia-idle-clock
+          systemd-analyze verify "$RUNNER_TEMP/unit/nvidia-idle-clock@0.service"
+
+      - name: Run tests
+        run: |
+          # tests/run.sh lands in a separate PR; keep the step green (and
+          # visible) until then instead of failing on a missing file.
+          if [ -f tests/run.sh ]; then
+            bash tests/run.sh
+          else
+            echo "tests/run.sh not present yet - skipping"
+          fi
