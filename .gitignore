@@ -1,4 +1,12 @@
-*.pdf
-orch-status/
-mizuho*/
-__pycache__/
+# このディレクトリは他プロジェクトと共用のため、追跡対象を明示的に限定する
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/README.en.md
+!/install.sh
+!/uninstall.sh
+!/nvidia-idle-clock
+!/nvidia-idle-clock@.service
+!/img/
+!/img/*.png
