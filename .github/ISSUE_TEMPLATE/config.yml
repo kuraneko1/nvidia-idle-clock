@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/kuraneko1/nvidia-idle-clock/security/advisories/new
+    about: >-
+      Do not open a public issue for a vulnerability. This service runs as root
+      and changes GPU clock state; report privately through a GitHub Security
+      Advisory. See SECURITY.md.
