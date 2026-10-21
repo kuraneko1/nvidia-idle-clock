@@ -1,0 +1,99 @@
+name: Bug report
+description: Report a defect in the daemon, the systemd unit, or the installers.
+title: "[bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security issues here: this service runs as root
+        and changes GPU clock state. See
+        [SECURITY.md](https://github.com/kuraneko1/nvidia-idle-clock/blob/main/SECURITY.md)
+        for the private reporting route.
+
+        Redact hostnames, IP addresses and any other infrastructure details
+        before pasting logs.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `git rev-parse HEAD` in your checkout, or the release tag.
+      placeholder: 2cab5f3
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the exact log lines. The daemon logs `key=value` fields, which makes them easy to paste.
+      placeholder: |
+        level=warn gpu=0 msg="clamp not applied" ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, and whether a GPU was actually clamped.
+      placeholder: |
+        1. sudo ./install.sh 0
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        GPU model, driver version, distribution and systemd version. `nvidia-smi -q`
+        covers most of it (redact the serial number and UUID if you prefer).
+      placeholder: |
+        GPU:       Tesla V100-PCIE-16GB (GV100)
+        Driver:    580.178.04
+        Distro:    Ubuntu 24.04
+        systemd:   255
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: clock-state
+    attributes:
+      label: Clock and power state
+      description: |
+        Output of `nvidia-smi -q -d CLOCK,POWER` (or a full `nvidia-smi -q`).
+        A clamp that was not released is visible here as an application clock.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: unit-state
+    attributes:
+      label: Service state
+      description: |
+        Output of `systemctl status 'nvidia-idle-clock@*'` and
+        `journalctl -u nvidia-idle-clock@0 --no-pager -n 50`.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: This is not a security issue (those go through SECURITY.md, not the tracker).
+          required: true
+        - label: I checked that the clock lock was actually left in place (`nvidia-smi -q -d CLOCK`), not just the log line.
+          required: false

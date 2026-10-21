@@ -1,0 +1,62 @@
+name: Feature request
+description: Suggest a change in behaviour, portability, or tooling.
+title: "[feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project deliberately has no runtime dependencies beyond bash,
+        coreutils, `nvidia-smi` and systemd, and it runs as root on a single
+        host. Requests that add a daemon, a package, or a network listener are
+        usually out of scope.
+
+        Security issues: see
+        [SECURITY.md](https://github.com/kuraneko1/nvidia-idle-clock/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is awkward or missing today? Describe the situation, not only the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should happen instead? Command lines, log format and unit settings help.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "do nothing" and any existing workaround.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - daemon (nvidia-idle-clock)
+        - systemd unit
+        - installer / uninstaller
+        - portability (other GPUs, drivers, nvidia-smi location)
+        - documentation
+        - tests / CI
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This does not require a new runtime dependency.
+          required: true
+        - label: This does not require internet access or a network listener on the host.
+          required: false
