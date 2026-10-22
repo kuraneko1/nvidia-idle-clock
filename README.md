@@ -5,7 +5,7 @@
 VRAM に何か載ると高クロックに張り付いたままになる NVIDIA GPU 向け。
 **アイドル時だけ** `nvidia-smi -lgc` でクロック上限を絞り、負荷を検出すると解除する systemd デーモン。
 **GPU ごとに独立したインスタンス**として動き、1枚ずつ別々の設定を割り当てられる。
-依存は bash と `nvidia-smi` だけで、NVAPI も CUDA toolkit もビルドも要らない。
+必須の依存は bash と `nvidia-smi` だけで、NVAPI も CUDA toolkit もビルドも要らない。
 
 | 状態 | クランプなし | クランプ 135MHz | 差 |
 |---|---|---|---|
@@ -47,6 +47,7 @@ VRAM に何か載ると高クロックに張り付いたままになる NVIDIA G
 | そのときの電力 | 37.9〜42.4W | **25.2〜28.9W** |
 | 負荷が来たとき | そのまま実行 | 次のサンプルで検出し、`nvidia-smi -rgc` の起動と driver の復帰を経て解除。タイムライン図の測定では 0.5 秒以内、カーネル内計測では 0.18〜0.22 秒で 1300MHz 到達 |
 | 負荷が 30 秒途切れたとき | 高いクロックのまま | 135MHz に戻る |
+| 解除直後に負荷が戻ったとき | — | `COOLDOWN_SECONDS` (既定 60 秒) の間は再クランプしない (解除は遅らせない) |
 | VRAM が空のとき | driver が自分で 135MHz まで落とす | **何もしない** (同じ) |
 | PState | P0 のまま | P0 のまま (変化なし) |
 
@@ -69,9 +70,9 @@ index, pstate, clocks.current.graphics [MHz], clocks.max.graphics [MHz], power.d
 - PState (V100 は常に P0)
 - プロセスの VRAM、CUDA コンテキスト、計算結果
 - persistence mode、電力上限、PCIe リンク、ファン制御
-- クロック上限 (解除後は 1380MHz まで戻る。停止・再起動時は `-rgc` で driver 既定に戻るが、
-  「元のロックを復元」ではなく「既定値にリセット」。VRAM を保持していると数秒で driver 管理の
-  クロックに戻る — 下記「注意」を参照)
+- クロック上限 (解除後は 1380MHz まで戻る。停止時に `-rgc` するのは **自分がクランプした GPU
+  だけ**で、「元のロックを復元」ではなく「既定値にリセット」。VRAM を保持していると数秒で
+  driver 管理のクロックに戻る — 下記「注意」を参照)
 
 ### 代償
 
@@ -108,7 +109,8 @@ NVML の利用率は 1/6〜1 秒の[窓平均](https://docs.nvidia.com/deploy/nv
 - NVIDIA driver と `nvidia-smi`。`-lgc` / `-rgc` が使えること (`nvidia-smi -h` に `-lgc` があること)
 - Volta 以降 (sm70+)。`-lgc` は Volta 以降でのみ使える
 - root (`-lgc` / `-rgc` は root 専用)
-- bash 4.2+ と coreutils。それ以外の依存はない (NVAPI / CUDA toolkit / ビルド不要)
+- bash 4.2+ と coreutils、util-linux の `flock` (任意: 無い場合は警告して GPU 排他だけ無効化)。
+  それ以外の依存はない (NVAPI / CUDA toolkit / ビルド不要)
 
 ## 対応ハードウェア
 
@@ -190,7 +192,7 @@ systemd の動作、ソースファイルの存在を確認し、引数エラー
 ## デーモンのコマンドライン
 
 ```
-usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]
+usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run] [-u|--unlock]
 ```
 
 | オプション | 動作 |
@@ -198,29 +200,40 @@ usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]
 | `-h`, `--help` | 使い方を表示して終了 |
 | `-V`, `--version` | `nvidia-idle-clock 0.2.0` を表示して終了 |
 | `-n`, `--dry-run` | 設定を検証し、解決後のプランを表示して終了。`-lgc` / `-rgc` は呼ばない |
+| `-u`, `--unlock` | マーカーのある GPU だけを `-rgc` で解除して終了 (下記) |
 | なし | フォアグラウンドでデーモンとして動く (systemd `Type=simple`) |
 
 `--help` / `--version` は設定検証より前に、`--dry-run` は設定検証と対象 GPU の解決の後、
 最初の `-lgc` / `-rgc` より前に処理される。未知のオプションと位置引数は
 `level=error msg="unknown argument"` と usage を stderr に出して **exit 2** で終了する。
 
+`--unlock` は、SIGKILL・OOM・`TimeoutStopSec` 超過などでデーモン自身が解除できなかった
+クランプの復旧用で、ユニットの `ExecStopPost` がこれを実行する。対象 GPU のうち
+`$STATE_DIR/gpu<N>.locked` があるものだけを `-rgc` してマーカーを消す。何も無ければ exit 0、
+`-rgc` に失敗した GPU があれば exit 1。生きているインスタンスが `flock` を持っている GPU は
+`level=warn msg="gpu managed by another instance"` を出してスキップする。解除だけなので
+`clocks.max.gr` の検証は行わない。
+
 ```
 $ nvidia-idle-clock --dry-run
-level=info msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 nvidia_smi=/usr/bin/nvidia-smi
-level=info msg="would clamp when idle" gpu=0 after_idle_s=30 util_threshold_pct=0 min_mhz=135 cap_mhz=135 skip_if_low=1
-level=info msg="would unlock on use or exit" gpu=0 trigger=util,exit
+level=info msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 nvidia_smi=/usr/bin/nvidia-smi state_dir=/run/nvidia-idle-clock
+level=info msg="would clamp when idle" gpu=0 after_idle_s=30 util_threshold_pct=0 min_mhz=135 cap_mhz=135 skip_if_low=1 cooldown_s=60
+level=info msg="would unlock on use or exit" gpu=0 trigger=util,exit,startup only_if_marked=1
 ```
 
 終了コード:
 
 | code | 意味 |
 |---|---|
-| `0` | 正常停止 (SIGTERM / SIGINT)、または `--help` / `--version` / `--dry-run` の成功 |
+| `0` | 正常停止 (SIGTERM / SIGINT)、または `--help` / `--version` / `--dry-run` / `--unlock` の成功 |
 | `1` | 実行時エラー (対象 GPU なし、`nvidia-smi` が見つからない、ストリーム停止、解除失敗など) |
 | `2` | 設定値の不正、または不明な引数 |
+| `3` | 対象 GPU を既に別のインスタンスが管理している (何も触っていない) |
 
 設定値の検証は GPU に触る前に行われ、不正なら `level=error msg="invalid config"` を出して
-exit 2、`nvidia-smi` が見つからなければ exit 1 で終了する。
+exit 2、`nvidia-smi` が見つからなければ exit 1 で終了する。exit 3
+(`msg="gpu already managed"`) は設定ミスなので、ユニットは `RestartPreventExitStatus=3` で
+再起動しない。
 
 ## GPU ごとの割り当て
 
@@ -242,9 +255,10 @@ Environment=IDLE_SECONDS=120
 sudo systemctl restart nvidia-idle-clock@0.service
 ```
 
-**`GPU=` に既存インスタンスと同じ GPU を指定しないこと。** 同じカードを 2 つのインスタンスが
-取り合い、片方の起動・停止時の `-rgc` がもう片方のクランプを解除する (警告は出ない)。
-既定ではインスタンス名 = GPU index なので、通常は重複しない。
+**`GPU=` に既存インスタンスと同じ GPU を指定しないこと。** 対象 GPU は `flock` で排他され、
+2 つ目のインスタンスは `level=error msg="gpu already managed"` を出して **exit 3** で終了する
+(`RestartPreventExitStatus=3` なので再起動ループにもならない)。既定ではインスタンス名 =
+GPU index なので、通常は重複しない。
 
 例:
 
@@ -340,29 +354,51 @@ A1/A2、B1/B2 は同じボードの隣接ペアの差分なので、熱ドリフ
 
 ### 参考: 実機のログ
 
-1 インスタンスで複数 GPU (`GPU=0,1`) を持つ場合の例。タイムスタンプは journald が付けるので、
-スクリプト自身は出力しない。
+タイムスタンプは journald が付けるので、スクリプト自身は出力しない。既定値
+(`IDLE_SECONDS=30`, `SAMPLE_MS=200`, `COOLDOWN_SECONDS=60`) での 1 サイクル:
 
 ```
 $ journalctl -u nvidia-idle-clock@0 -o cat
-level=info msg="started" gpu=0,1 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 util_threshold_pct=0 reassert_s=30 skip_if_low=1 nvidia_smi=/usr/bin/nvidia-smi
+level=info msg="no stale clamp markers" gpu=0 state_dir=/run/nvidia-idle-clock
+level=info msg="started" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 util_threshold_pct=0 reassert_s=30 skip_if_low=1 cooldown_s=60 state_dir=/run/nvidia-idle-clock nvidia_smi=/usr/bin/nvidia-smi
 level=info msg="clamp verified" gpu=0 trigger=idle was_mhz=1230 observed_mhz=135 min_mhz=135 cap_mhz=135
-level=info msg="clamp verified" gpu=1 trigger=idle was_mhz=1260 observed_mhz=135 min_mhz=135 cap_mhz=135
 level=info msg="unlocked" gpu=0 trigger=util util_pct=42
-level=info msg="stream lost" retry_s=2 stderr=""
-level=info msg="unlocked" gpu=0 trigger=exit
-level=info msg="unlocked" gpu=1 trigger=exit
-level=info msg="exit" gpu=0,1 rc=0
+level=info msg="clamp delayed" gpu=0 reason=cooldown remaining_s=30 cooldown_s=60
+level=info msg="exit" gpu=0 rc=0
+# ユニットの ExecStopPost (--unlock)
+level=info msg="unlock done" gpu=0 released=none rc=0
+```
+
+クランプが残った場合の復旧経路:
+
+```
+# 停止時にユニットの ExecStopPost が実行する (--unlock)
+level=info msg="unlocked" gpu=0 trigger=unlock
+level=info msg="unlock done" gpu=0 released=0 rc=0
+
+# マーカーが残ったまま次回起動した場合
+level=info msg="stale clamp markers found" gpu=0 state_dir=/run/nvidia-idle-clock action=release
+level=info msg="unlocked" gpu=0 trigger=startup
+```
+
+同じ GPU を 2 つのインスタンスが管理しようとした場合:
+
+```
+level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nvidia-idle-clock/gpu1.lock"
 ```
 
 - `level=` と `msg="..."` が先頭の 2 フィールド。`msg` は固定の識別子なので、自由文ではなく
   `msg="..."` で grep する。
 - `level=` は syslog priority ではないため `journalctl -p warning` では絞れない。
   `journalctl -u nvidia-idle-clock@0 -g 'level=(warn|error)'` を使う。
-- SIGTERM での正常停止では最後の行が `msg="exit" rc=0`。解除に失敗した場合は
-  `msg="unlock failed"` のあとに `msg="exit" rc=1` が続く。
-- 上の `was_mhz` が GPU0 1230 / GPU1 1260 と違うのは、既定のアイドルクロックがボードで
-  異なるため。単一の 1260MHz を前提にしないこと。
+- デーモン自身の最後の行は `msg="exit" rc=0`。そのあとにユニットの `ExecStopPost`
+  (`--unlock`) が `msg="unlock done"` を出す。解除に失敗した場合は `msg="unlock failed"` の
+  あとに `msg="exit" rc=1` が続く。
+- `msg="gpu already managed"` は exit 3。ユニットは `RestartPreventExitStatus=3` なので
+  再起動しない。
+- `msg="clamp delayed"` は `COOLDOWN_SECONDS` による正常な抑制で、エラーではない。
+- `was_mhz` は GPU の既定アイドルクロック (実測: GPU0 1230MHz / GPU1 1260MHz)。
+  ボードによって異なるので、単一の 1260MHz を前提にしないこと。
 
 ## 設定
 
@@ -378,17 +414,44 @@ level=info msg="exit" gpu=0,1 rc=0
 | `UTIL_THRESHOLD` | `0` | これ以下の利用率をアイドルとみなす % |
 | `REASSERT_SECONDS` | `30` | クランプ再適用の間隔 s |
 | `SKIP_IF_LOW` | `1` | 既に低クロックでアイドル中の GPU にはクランプしない |
+| `COOLDOWN_SECONDS` | `60` | 解除後、この秒数は同じ GPU を再クランプしない (0 で無効。解除は遅らせない) |
+| `STATE_DIR` | `/run/nvidia-idle-clock` | マーカーと `flock` のディレクトリ (デーモンが 0700 で作成) |
 | `NVSMI` | `PATH` 上の `nvidia-smi` | 使う `nvidia-smi` のパス (テスト・特殊な配置用) |
 
 `GPU` に存在しない index を指定した場合は除外して警告を出す。全部無効なら起動に失敗する。
 設定値が不正なら `msg="invalid config"` を出して exit 2、`nvidia-smi` が見つからなければ exit 1 で
-終了する (どちらも GPU に触る前)。
+終了する (どちらも GPU に触る前)。同じ GPU を既に別インスタンスが管理している場合は
+`msg="gpu already managed"` を出して exit 3 で終了する。
+
+## 状態ディレクトリと排他
+
+クランプはプロセスの外に状態を残す。
+
+- `STATE_DIR` (既定 `/run/nvidia-idle-clock`) に GPU ごとのファイルを置く。デーモンが
+  mode 0700 で作成する。
+  - `gpu<N>.locked` — クランプを検証したあとに作るマーカー。解除で消える。
+  - `gpu<N>.lock` — `flock` の対象。排他用。
+- マーカーは「このプロセスがこの GPU をクランプした」という唯一の記録。プロセスが落ちても
+  残るので、次回起動時と `--unlock` はマーカーのある GPU だけを解除できる。逆に、マーカーの
+  無い GPU は他ツールのロックかもしれないので触らない。
+- 同じ GPU を 2 つのインスタンスが指すと、2 つ目は `flock` を取れず
+  `msg="gpu already managed"` で exit 3。ユニットは `RestartPreventExitStatus=3` なので
+  再起動しない。
+- 停止時はユニットの `ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock` が走る。
+  EXIT トラップが実行できない SIGKILL・OOM・`TimeoutStopSec` 超過でも、マーカーのある GPU を
+  解除できる。
+- ユニットは `ProtectSystem=strict` で `/run` も読み取り専用になるため、`ReadWritePaths=/run`
+  と `ReadOnlyPaths=/run/systemd /run/udev /run/log` を設定してマーカーを書けるように
+  している。`ReadWritePaths=/run/nvidia-idle-clock` はディレクトリが存在しない初回起動で
+  ユニットごと失敗する (`226/NAMESPACE`) ため使えない。`RuntimeDirectory=` も使わない
+  (停止時に消えてしまい、`--unlock` が読むマーカーが残らない)。
+- `flock` が無い環境では警告して排他だけ無効化する (デーモン自体は起動する)。
 
 ## 動作
 
 - 対象 GPU の利用率を `SAMPLE_MS` 間隔で監視 (インスタンスごとに独立)
 - `IDLE_SECONDS` 無負荷 → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
-- 利用率 > `UTIL_THRESHOLD` → `-rgc` で解除
+- 利用率 > `UTIL_THRESHOLD` → `-rgc` で解除 (`COOLDOWN_SECONDS` 中でも解除は即時)
 - `SKIP_IF_LOW=1` のとき既に低クロックなら何もしない (VRAM が空なら不要なため)
 - 利用率ストリームが `max(5秒, 5×SAMPLE_MS)` のあいだ途切れたら、その `nvidia-smi` を停止して
   exit 1 で終了する (`msg="utilization stream stale"`)。systemd は `Restart=on-failure` で再起動する
@@ -397,11 +460,15 @@ level=info msg="exit" gpu=0,1 rc=0
   `msg="utilization stream unavailable"` で exit 1
 - 非数値の利用率 (`[N/A]`) は「利用不可」として扱う。クランプ中なら解除し (安全側)、
   アイドル時間はリセットし、警告は streak ごとに 1 回だけ出す
-- 起動時にも対象 GPU に `-rgc` を実行する (このデーモンが付けたロックだけを外す実装ではない。
-  他ツールのクロックロックと併用しないこと)
-- 停止・再起動時は `-rgc` で解除する。ただし SIGKILL・OOM・`TimeoutStopSec` 超過では
-  シェルの trap が走らないため解除できない (ユニットに `ExecStopPost` は無い)。その場合は
-  次回起動時の `-rgc` で既定に戻る (起動時は常に対象 GPU に `-rgc` を実行する)
+- 解除後 `COOLDOWN_SECONDS` (既定 60 秒) は同じ GPU を再クランプしない。短いクランプ/解除の
+  繰り返しを防ぐためで、`0` で無効化できる
+- 起動時は、前回のクランプが残したマーカーがある GPU だけを `-rgc` で解除する。マーカーの
+  無い GPU には触れないので、他ツールが設定したクロックロックを起動だけで消すことはない
+- 停止時は自分がクランプした GPU だけを `-rgc` で解除する。SIGKILL・OOM・`TimeoutStopSec`
+  超過で trap が走らなくても、ユニットの `ExecStopPost` が `--unlock` を実行し、マーカーの
+  ある GPU を解除する
+- 同じ GPU を別インスタンスが管理している場合は起動せず exit 3
+  (`RestartPreventExitStatus=3`)
 
 ## 注意
 
@@ -417,11 +484,13 @@ level=info msg="exit" gpu=0,1 rc=0
   [nvidia-pstated](https://github.com/sasha0552/nvidia-pstated) が該当する。
   上流の README には消費電力の数値が無く、当方で P40 を測ったこともないため、
   この README からは数値を引用しない。
+- 解除直後は `COOLDOWN_SECONDS` (既定 60 秒) の間クランプしない。短いアイドルが続く間は
+  その分の節電が無い。`0` で無効化でき、解除そのものは cooldown で遅れない。
 - `-rgc` は driver 既定のポリシーに戻すだけで、低クロックを強制しない。VRAM を保持していると
   数秒で driver 管理のクロックまで戻る (PG500-216 / 8GiB 保持・既定 1260MHz での実測:
   135MHz / 28.51W → 3 秒後に 1260MHz / 38.97W、10 秒平均 28.51W → 40.31W、
-  **+11.8W / +29.3%**)。クランプによる節電は次の再適用
-  (既定 30 秒) まで失われる。ロックが無い、または VRAM が空のときだけ no-op。
+  **+11.8W / +29.3%**)。クランプによる節電は、解除後の `COOLDOWN_SECONDS` (既定 60 秒) と
+  次のアイドル判定が終わるまで失われる。ロックが無い、または VRAM が空のときだけ no-op。
 
 ## 共有 GPU での注意
 
@@ -435,8 +504,9 @@ level=info msg="exit" gpu=0,1 rc=0
 - カードの利用率が 0 の間、同じカードの全プロセス・全コンテキストが 135MHz で走る
   (MIG のコンピュートインスタンスもクロックを共有する)。解除は次のサンプル周期 + `-rgc` 起動 +
   driver 復帰 (既定 0.2〜0.5 秒) 後。
-- `Environment=GPU=` の重複で 2 つのインスタンスが同じカードを指すと、片方の起動・停止時の
-  `-rgc` が相手のクランプを最大 `REASSERT_SECONDS` (既定 30 秒) 解除する。警告は出ない。
+- `Environment=GPU=` の重複で 2 つのインスタンスが同じカードを指すと、2 つ目は起動時に
+  `msg="gpu already managed"` を出して exit 3 で終了する (`flock` による排他)。
+  `RestartPreventExitStatus=3` なので再起動ループにはならない。
 - 自分の管理下のカード (ワークステーション、単独利用の推論サーバ) でのみ使うこと。
 
 ## 先行事例

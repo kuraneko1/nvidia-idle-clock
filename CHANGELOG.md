@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-10-22
 
 First tagged release. Entries are grouped by area: **daemon**
 (`nvidia-idle-clock`), **systemd** (the template unit), **installer**
@@ -15,15 +15,31 @@ First tagged release. Entries are grouped by area: **daemon**
 
 ### Added
 
-- **daemon:** `-h`/`--help`, `-V`/`--version` and `-n`/`--dry-run` are parsed
-  before configuration validation and before any `nvidia-smi` call, so
-  `--help` cannot start the daemon or touch a GPU. `--version` prints
-  `nvidia-idle-clock 0.2.0`; `--dry-run` validates the configuration, prints
-  the resolved plan and exits without calling `-lgc`/`-rgc`. Unknown options
-  and positional arguments print usage on stderr and exit 2 (#38).
+- **daemon:** `-h`/`--help`, `-V`/`--version`, `-n`/`--dry-run` and
+  `-u`/`--unlock` are parsed before configuration validation and before any
+  `nvidia-smi` call, so `--help` cannot start the daemon or touch a GPU.
+  `--version` prints `nvidia-idle-clock 0.2.0`; `--dry-run` validates the
+  configuration, prints the resolved plan and exits without calling
+  `-lgc`/`-rgc`. Unknown options and positional arguments print usage on
+  stderr and exit 2 (#38).
 - **daemon:** the exit-status contract is documented and enforced: 0 for a
-  clean stop (or a successful `--help`/`--version`/`--dry-run`), 1 for a
-  runtime failure, 2 for an invalid configuration or argument (#38).
+  clean stop (or a successful `--help`/`--version`/`--dry-run`/`--unlock`),
+  1 for a runtime failure, 2 for an invalid configuration or argument, and 3
+  for a GPU already managed by another instance (#38, #41).
+- **daemon:** `--unlock` releases exactly the GPUs that carry a state marker:
+  exit 0 when there was nothing to do, 1 if `-rgc` failed, and a GPU held by a
+  live instance is skipped. `$STATE_DIR` (default `/run/nvidia-idle-clock`,
+  mode 0700) holds the `gpu<N>.locked` marker written after a verified clamp
+  and the `gpu<N>.lock` used for exclusion (#9, #20).
+- **daemon:** `COOLDOWN_SECONDS` (default 60, 0 disables) keeps the same GPU
+  from being re-clamped for that long after a release, so bursty load cannot
+  make the clock flap. Releases are never delayed (#18).
+- **daemon:** a non-blocking `flock` on `$STATE_DIR/gpu<N>.lock` gives one
+  instance exclusive ownership of a GPU; a second instance targeting it logs
+  `msg="gpu already managed"` and exits 3 (#21).
+- **systemd:** `ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock`
+  releases exactly the marked GPUs after every stop, including SIGKILL, OOM
+  and a `TimeoutStopSec` overrun (#9).
 - **docs:** the idle-power section now carries the measured A/B table
   (4 × 600s samples, ~31GiB/GPU held in VRAM vs empty, clamped vs unclamped)
   with its method and caveats, the annual kWh at 25/50/75/100% idle duty, a
@@ -48,9 +64,10 @@ First tagged release. Entries are grouped by area: **daemon**
 ### Changed
 
 - **daemon:** `GPU`, `IDLE_CAP`, `MIN_CLK`, `IDLE_SECONDS`, `SAMPLE_MS`,
-  `UTIL_THRESHOLD`, `REASSERT_SECONDS` and `SKIP_IF_LOW` are validated at
-  startup; an invalid value fails closed with a `level=error` line instead of
-  silently clamping the wrong way (#3).
+  `UTIL_THRESHOLD`, `REASSERT_SECONDS`, `SKIP_IF_LOW` and `COOLDOWN_SECONDS`
+  are validated at startup (and `STATE_DIR` must not be empty); an invalid
+  value fails closed with a `level=error` line instead of silently clamping
+  the wrong way (#3).
 - **daemon:** comments, log messages and installer output are English, with
   stable `key=value` fields on every log line (#31).
 - **systemd:** the unit runs with filesystem, namespace and kernel-interface
@@ -58,7 +75,11 @@ First tagged release. Entries are grouped by area: **daemon**
   of plain root with no restrictions. `CapabilityBoundingSet=` and
   `SystemCallFilter=` are deliberately left at the systemd defaults because the
   capability set that NVML `-lgc`/`-rgc` needs has not been validated on
-  hardware (#10).
+  hardware. The state directory needs one writable path, so the unit grants
+  `ReadWritePaths=/run` and keeps `ReadOnlyPaths=/run/systemd /run/udev
+  /run/log`: a narrower `ReadWritePaths=/run/nvidia-idle-clock` fails with
+  `226/NAMESPACE` on a fresh boot, and `RuntimeDirectory=` is deliberately not
+  used because it would delete the markers on stop (#10, #20).
 - **systemd:** startup waits until the NVIDIA driver has finished probing
   (`ConditionPathExists=/dev/nvidiactl`, `After=dev-nvidiactl.device`) and the
   restart budget/interval are sized so a boot race can recover instead of
@@ -66,6 +87,12 @@ First tagged release. Entries are grouped by area: **daemon**
 - **systemd:** the instance name is validated as a GPU index before the daemon
   starts, so a typo fails fast instead of becoming a permanently failed unit
   (#30).
+- **systemd:** `RestartPreventExitStatus=3` keeps "GPU already managed" from
+  turning into a restart loop (#21).
+- **daemon:** startup no longer runs `-rgc` unconditionally: it releases only
+  GPUs carrying a stale marker from an interrupted instance, so a clock lock
+  another tool set on another GPU is never touched. A clean stop releases only
+  the GPUs this instance clamped and holds the lock for (#20).
 - **installer:** `install.sh` parses its own options (`-h`/`--help`,
   `-V`/`--version`, `-n`/`--dry-run`, `--force`, `--gpus LIST`, `--`), rejects
   unknown options and invalid GPU arguments with usage on stderr and exit 2,
@@ -114,6 +141,17 @@ First tagged release. Entries are grouped by area: **daemon**
 - **daemon:** clamp lines log the clock observed *after* the operation, unlock
   lines log the trigger/utilization, and failures use `level=warn`/
   `level=error`, so anomalies can be filtered out of the journal (#29).
+- **daemon:** a clamp can no longer be left on the device by SIGKILL, OOM or a
+  stop timeout: the marker survives and `--unlock` (unit `ExecStopPost`) or
+  the next start releases it (#9).
+- **daemon:** short clamp/release flapping under bursty load is suppressed by
+  the re-clamp cooldown (#18).
+- **daemon:** startup and stop no longer reset clock locks this instance did
+  not set, and two instances on one GPU no longer release each other's clamp
+  (#20, #21).
+- **docs:** the README documents the state directory, `--unlock`, the
+  supervisor release, the re-clamp cooldown and the per-GPU exclusion, and its
+  sample log now shows the merged log lines (#41).
 - **installer:** an existing binary is no longer overwritten silently, and
   running instances are switched to the new code after an upgrade when the
   payload changed (#22).

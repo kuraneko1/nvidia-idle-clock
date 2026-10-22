@@ -6,7 +6,7 @@ For NVIDIA GPUs that park at a high clock and never come down while something si
 A systemd daemon that clamps the clock ceiling with `nvidia-smi -lgc` **only while idle**,
 and releases it when load appears. It runs **one independent instance per GPU**,
 so each card can have its own settings.
-Dependencies are bash and `nvidia-smi` — no NVAPI, no CUDA toolkit, no build step.
+The only required dependencies are bash and `nvidia-smi` — no NVAPI, no CUDA toolkit, no build step.
 
 | State | No clamp | Clamped @135MHz | Saving |
 |---|---|---|---|
@@ -50,6 +50,7 @@ conditions and raw numbers.
 | Power in that state | 37.9–42.4W | **25.2–28.9W** |
 | When load arrives | runs as-is | detected on the next sample, then `nvidia-smi -rgc` spawn and driver ramp: ≤0.5s in the timeline figure, 0.18–0.22s to reach 1300MHz measured in-kernel |
 | 30s after load stops | still at the high clock | back to 135MHz |
+| Load returns right after a release | — | not re-clamped for `COOLDOWN_SECONDS` (default 60s); releases are never delayed |
 | When VRAM is empty | driver drops to 135MHz by itself | **does nothing** (same) |
 | P-State | stays P0 | stays P0 (unchanged) |
 
@@ -72,9 +73,9 @@ index, pstate, clocks.current.graphics [MHz], clocks.max.graphics [MHz], power.d
 - P-State (V100 is always P0)
 - Process VRAM, CUDA contexts, numerical results
 - persistence mode, power limits, PCIe link, fan control
-- Maximum clock (returns to 1380MHz once released; stop/restart also resets the clocks to the
-  driver default with `-rgc`, which *resets to the default* rather than restoring a previous lock —
-  with VRAM still held the clock is back at the driver-managed value within seconds, see Notes)
+- Maximum clock (returns to 1380MHz once released; on stop only the GPUs **this instance clamped**
+  get `-rgc`, which *resets to the default* rather than restoring a previous lock — with VRAM
+  still held the clock is back at the driver-managed value within seconds, see Notes)
 
 ### Cost
 
@@ -112,7 +113,8 @@ workload spent 185ms of its 500ms (37%) at 126MHz.
 - NVIDIA driver and `nvidia-smi`, with `-lgc` / `-rgc` available (`nvidia-smi -h` lists `-lgc`)
 - Volta or newer (sm70+); `-lgc` only exists from Volta on
 - root (`-lgc` / `-rgc` are root-only)
-- bash 4.2+ and coreutils. Nothing else — no NVAPI, no CUDA toolkit, no build step
+- bash 4.2+, coreutils, and util-linux `flock` (optional: without it the daemon warns and only
+  the per-GPU exclusion is disabled). Nothing else — no NVAPI, no CUDA toolkit, no build step
 
 ## Supported hardware
 
@@ -196,7 +198,7 @@ backup (`<path>.bak.<YYYYMMDDTHHMMSS>`).
 ## Daemon command line
 
 ```
-usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]
+usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run] [-u|--unlock]
 ```
 
 | Option | Effect |
@@ -204,29 +206,40 @@ usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]
 | `-h`, `--help` | print usage and exit |
 | `-V`, `--version` | print `nvidia-idle-clock 0.2.0` and exit |
 | `-n`, `--dry-run` | validate the configuration, print the resolved plan and exit; never calls `-lgc` / `-rgc` |
+| `-u`, `--unlock` | release only the GPUs that carry a state marker and exit (see below) |
 | none | run the daemon in the foreground (systemd `Type=simple`) |
 
 `--help` / `--version` are handled before configuration validation; `--dry-run` runs after
 validation and GPU resolution but before the first `-lgc` / `-rgc`. Unknown options and positional
 arguments print `level=error msg="unknown argument"` plus the usage line on stderr and exit **2**.
 
+`--unlock` is the recovery path for a clamp that outlived its daemon (SIGKILL, OOM,
+`TimeoutStopSec`); the unit runs it as `ExecStopPost`. It runs `-rgc` only for target GPUs that
+carry `$STATE_DIR/gpu<N>.locked` and removes each marker it released. Nothing to do is exit 0; a
+failed `-rgc` is exit 1. A GPU whose `flock` is held by a live instance is skipped with
+`level=warn msg="gpu managed by another instance"`. It does not run the `clocks.max.gr` check
+because it only releases.
+
 ```
 $ nvidia-idle-clock --dry-run
-level=info msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 nvidia_smi=/usr/bin/nvidia-smi
-level=info msg="would clamp when idle" gpu=0 after_idle_s=30 util_threshold_pct=0 min_mhz=135 cap_mhz=135 skip_if_low=1
-level=info msg="would unlock on use or exit" gpu=0 trigger=util,exit
+level=info msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 nvidia_smi=/usr/bin/nvidia-smi state_dir=/run/nvidia-idle-clock
+level=info msg="would clamp when idle" gpu=0 after_idle_s=30 util_threshold_pct=0 min_mhz=135 cap_mhz=135 skip_if_low=1 cooldown_s=60
+level=info msg="would unlock on use or exit" gpu=0 trigger=util,exit,startup only_if_marked=1
 ```
 
 Exit status:
 
 | Code | Meaning |
 |---|---|
-| `0` | clean stop (SIGTERM / SIGINT), or `--help` / `--version` / `--dry-run` succeeded |
+| `0` | clean stop (SIGTERM / SIGINT), or `--help` / `--version` / `--dry-run` / `--unlock` succeeded |
 | `1` | runtime failure (no usable GPU, `nvidia-smi` missing, stalled stream, unlock failed, ...) |
 | `2` | invalid configuration or unknown argument |
+| `3` | the GPU is already managed by another instance (nothing was touched) |
 
 Configuration is validated before any GPU is touched: an invalid value logs
-`level=error msg="invalid config"` and exits 2, a missing `nvidia-smi` exits 1.
+`level=error msg="invalid config"` and exits 2, a missing `nvidia-smi` exits 1. Exit 3
+(`msg="gpu already managed"`) is a configuration mistake, so the unit sets
+`RestartPreventExitStatus=3` and does not restart-loop it.
 
 ## Per-GPU assignment
 
@@ -248,9 +261,10 @@ Environment=IDLE_SECONDS=120
 sudo systemctl restart nvidia-idle-clock@0.service
 ```
 
-**Do not point `GPU=` at a GPU that another instance already uses.** Two instances then fight over
-the same card, and the `-rgc` on one instance's start/stop releases the other's clamp (with no
-warning). By default the instance name *is* the GPU index, so this cannot happen by accident.
+**Do not point `GPU=` at a GPU that another instance already uses.** The card is excluded with
+`flock`; a second instance logs `level=error msg="gpu already managed"` and exits **3**
+(`RestartPreventExitStatus=3`, so it does not restart-loop). By default the instance name *is*
+the GPU index, so this cannot happen by accident.
 
 Example:
 
@@ -350,29 +364,51 @@ on the same board, so thermal drift cancels.
 
 ### Sample log
 
-One instance covering several GPUs (`GPU=0,1`). journald adds the timestamp, the script does not
-print one.
+journald adds the timestamp, the script does not print one. One cycle at the defaults
+(`IDLE_SECONDS=30`, `SAMPLE_MS=200`, `COOLDOWN_SECONDS=60`):
 
 ```
 $ journalctl -u nvidia-idle-clock@0 -o cat
-level=info msg="started" gpu=0,1 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 util_threshold_pct=0 reassert_s=30 skip_if_low=1 nvidia_smi=/usr/bin/nvidia-smi
+level=info msg="no stale clamp markers" gpu=0 state_dir=/run/nvidia-idle-clock
+level=info msg="started" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 util_threshold_pct=0 reassert_s=30 skip_if_low=1 cooldown_s=60 state_dir=/run/nvidia-idle-clock nvidia_smi=/usr/bin/nvidia-smi
 level=info msg="clamp verified" gpu=0 trigger=idle was_mhz=1230 observed_mhz=135 min_mhz=135 cap_mhz=135
-level=info msg="clamp verified" gpu=1 trigger=idle was_mhz=1260 observed_mhz=135 min_mhz=135 cap_mhz=135
 level=info msg="unlocked" gpu=0 trigger=util util_pct=42
-level=info msg="stream lost" retry_s=2 stderr=""
-level=info msg="unlocked" gpu=0 trigger=exit
-level=info msg="unlocked" gpu=1 trigger=exit
-level=info msg="exit" gpu=0,1 rc=0
+level=info msg="clamp delayed" gpu=0 reason=cooldown remaining_s=30 cooldown_s=60
+level=info msg="exit" gpu=0 rc=0
+# unit ExecStopPost (--unlock)
+level=info msg="unlock done" gpu=0 released=none rc=0
+```
+
+Recovery when a clamp was left behind:
+
+```
+# run by the unit's ExecStopPost on stop (--unlock)
+level=info msg="unlocked" gpu=0 trigger=unlock
+level=info msg="unlock done" gpu=0 released=0 rc=0
+
+# marker still present when the next instance starts
+level=info msg="stale clamp markers found" gpu=0 state_dir=/run/nvidia-idle-clock action=release
+level=info msg="unlocked" gpu=0 trigger=startup
+```
+
+When a second instance tries to manage the same GPU:
+
+```
+level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nvidia-idle-clock/gpu1.lock"
 ```
 
 - `level=` and `msg="..."` are the first two fields. `msg` is a stable identifier, so grep for
   `msg="..."`, never for free text.
 - `level=` is not a syslog priority, so `journalctl -p warning` will not filter on it; use
   `journalctl -u nvidia-idle-clock@0 -g 'level=(warn|error)'`.
-- A clean SIGTERM stop ends with `msg="exit" rc=0`; if the release failed, `msg="unlock failed"`
-  is followed by `msg="exit" rc=1`.
-- `was_mhz` is 1230 for GPU0 but 1260 for GPU1 because the default idle step differs per board.
-  Do not assume a single 1260MHz value.
+- The daemon's own last line is `msg="exit" rc=0`; the unit's `ExecStopPost` (`--unlock`) then
+  logs `msg="unlock done"`. If the release failed, `msg="unlock failed"` is followed by
+  `msg="exit" rc=1`.
+- `msg="gpu already managed"` is exit 3; the unit sets `RestartPreventExitStatus=3` so it does not
+  restart.
+- `msg="clamp delayed"` is the normal `COOLDOWN_SECONDS` suppression, not an error.
+- `was_mhz` is the board's default idle clock (measured: GPU0 1230MHz, GPU1 1260MHz). It differs
+  per board, so do not assume a single 1260MHz value.
 
 ## Configuration
 
@@ -388,17 +424,42 @@ Set `Environment=` per instance. `%i` (the instance name) is the default GPU.
 | `UTIL_THRESHOLD` | `0` | Utilization at or below this counts as idle (%) |
 | `REASSERT_SECONDS` | `30` | Re-apply interval for the clamp (s) |
 | `SKIP_IF_LOW` | `1` | Do not clamp GPUs already idling at a low clock |
+| `COOLDOWN_SECONDS` | `60` | Do not re-clamp the same GPU for this many seconds after a release (0 disables; releases are never delayed) |
+| `STATE_DIR` | `/run/nvidia-idle-clock` | Marker and `flock` directory (created by the daemon with mode 0700) |
 | `NVSMI` | `nvidia-smi` on `PATH` | Path to the `nvidia-smi` to use (testing, unusual layouts) |
 
 A non-existent index in `GPU` is dropped with a warning; if none remain, startup fails.
 An invalid value logs `msg="invalid config"` and exits 2; a missing `nvidia-smi` exits 1.
-Both happen before the daemon touches any GPU.
+Both happen before the daemon touches any GPU. If another instance already manages one of the
+target GPUs, the daemon logs `msg="gpu already managed"` and exits 3.
+
+## State directory and exclusion
+
+A clamp outlives the process that made it, so the daemon records it outside the process.
+
+- `STATE_DIR` (default `/run/nvidia-idle-clock`) holds one set of files per GPU and is created by
+  the daemon with mode 0700.
+  - `gpu<N>.locked` — marker written after a verified clamp, removed on release.
+  - `gpu<N>.lock` — `flock` target used for the per-GPU exclusion.
+- The marker is the only record that "this process clamped this GPU". It survives a crash, so the
+  next start and `--unlock` release exactly the marked GPUs. A GPU with no marker may belong to
+  another tool, so it is never touched.
+- If two instances target the same GPU, the second one cannot take the `flock` and exits 3 with
+  `msg="gpu already managed"`. The unit sets `RestartPreventExitStatus=3`, so it does not restart.
+- On stop the unit runs `ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock`. Even when the
+  EXIT trap cannot run (SIGKILL, OOM, `TimeoutStopSec`), the marked GPUs are released.
+- `ProtectSystem=strict` also makes `/run` read-only, so the unit grants `ReadWritePaths=/run` and
+  keeps `ReadOnlyPaths=/run/systemd /run/udev /run/log`. A narrower
+  `ReadWritePaths=/run/nvidia-idle-clock` cannot be used: on a fresh boot the directory does not
+  exist yet and the unit fails with `226/NAMESPACE`. `RuntimeDirectory=` is not used either,
+  because systemd deletes it on stop — exactly when the marker has to survive for `--unlock`.
+- Without `flock` the daemon warns and only the per-GPU exclusion is disabled (it still starts).
 
 ## Behaviour
 
 - Polls target GPU utilization every `SAMPLE_MS` (each instance independent)
 - `IDLE_SECONDS` idle → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
-- Utilization > `UTIL_THRESHOLD` → release with `-rgc`
+- Utilization > `UTIL_THRESHOLD` → release with `-rgc` (immediate even during `COOLDOWN_SECONDS`)
 - With `SKIP_IF_LOW=1`, already-low GPUs are left alone (nothing to do when VRAM is empty)
 - If the utilization stream delivers nothing for `max(5s, 5×SAMPLE_MS)`, the `nvidia-smi` child is
   stopped and the daemon exits 1 (`msg="utilization stream stale"`); systemd restarts it through
@@ -408,11 +469,15 @@ Both happen before the daemon touches any GPU.
   `msg="utilization stream unavailable"` and exit 1
 - Non-numeric utilization (`[N/A]`) is treated as unavailable: a held clamp is released (safe
   side), the idle clock is reset, and the warning is logged once per streak
-- Also runs `-rgc` at startup (this is not a "release only what I locked" implementation, so do not
-  run it next to another tool that manages clocks)
-- Releases with `-rgc` on stop/restart. SIGKILL, OOM and a `TimeoutStopSec` overrun cannot run the
-  shell trap, so those paths cannot release (the unit has no `ExecStopPost`). The next start does
-  run `-rgc` on every target GPU, which resets the clocks to the driver default
+- After a release, `COOLDOWN_SECONDS` (default 60s) keeps the same GPU from being re-clamped,
+  which stops short clamp/release flapping; `0` disables it
+- At startup only GPUs carrying a marker left by the previous clamp are released. A GPU without a
+  marker is never touched, so a clock lock another tool set is not reset by a plain start
+- On stop only the GPUs this instance clamped are released. When the EXIT trap cannot run
+  (SIGKILL, OOM, `TimeoutStopSec`), the unit's `ExecStopPost` runs `--unlock` and releases the
+  marked GPUs
+- A GPU already managed by another instance makes this one exit 3 before it touches anything
+  (`RestartPreventExitStatus=3`)
 
 ## Notes
 
@@ -428,11 +493,14 @@ Both happen before the daemon touches any GPU.
   [nvidia-pstate](https://github.com/sasha0552/nvidia-pstate) /
   [nvidia-pstated](https://github.com/sasha0552/nvidia-pstated). Their READMEs carry no power
   figures and we have not measured a P40, so this README quotes no numbers.
+- For `COOLDOWN_SECONDS` (default 60s) after a release the GPU is not clamped again, so short
+  idle gaps save nothing during that window. `0` disables it; the release itself is never delayed.
 - `-rgc` only restores the driver's default policy; it does not force a low clock. With VRAM held
   the clock is back at the driver-managed value within seconds (measured on PG500-216 / 8GiB held,
   1260MHz default: 135MHz / 28.51W → 3s later 1260MHz / 38.97W; 10s average 28.51W → 40.31W,
-  **+11.8W / +29.3%**), and the saving is lost until the next re-assert (30s by default). It is a
-  no-op only when there is no lock or VRAM is empty.
+  **+11.8W / +29.3%**), and the saving is lost until the re-clamp cooldown
+  (`COOLDOWN_SECONDS`, default 60s) and the next idle decision have passed. It is a no-op only
+  when there is no lock or VRAM is empty.
 
 ## Shared GPUs
 
@@ -447,8 +515,9 @@ per-process setting.
 - While device utilization is 0, every process and context on the card runs at 135MHz
   (MIG compute instances share the clock). The release comes one sample period + `-rgc` spawn +
   driver ramp later (0.2–0.5s at the defaults).
-- If `Environment=GPU=` makes two instances point at the same card, the `-rgc` on one instance's
-  start/stop releases the other's clamp for up to `REASSERT_SECONDS` (30s by default). No warning.
+- If `Environment=GPU=` makes two instances point at the same card, the second one logs
+  `msg="gpu already managed"` and exits 3 (`flock` exclusion). `RestartPreventExitStatus=3`
+  keeps that from becoming a restart loop.
 - Use it only on cards you own and nobody else uses (a workstation, a single-tenant inference box).
 
 ## Prior art / related work
