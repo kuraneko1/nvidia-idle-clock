@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# fake-nvidia-smi - a scriptable stand-in for nvidia-smi, used only by tests/.
+#
+# The daemon calls a small, fixed set of queries, so the fake models exactly
+# those and records every invocation. A test describes a scenario with FAKE_*
+# environment variables, runs the daemon with NVSMI=<this file>, and asserts on
+# the daemon's log and on this file's argument log. No GPU is touched.
+#
+# Scenario knobs (all optional):
+#   FAKE_STATE=dir            required; holds per-GPU clock state and counters
+#   FAKE_ARGV_LOG=file        default: $FAKE_STATE/argv.log
+#   FAKE_GPUS="0"             GPU indices reported by --query-gpu=index,uuid
+#   FAKE_MAX_CLK=1380         clocks.max.gr
+#   FAKE_CLOCK_IDLE=1260      clocks.gr before a clamp and after a successful -rgc
+#   FAKE_LGC_APPLIES=1        1: a successful -lgc moves clocks.gr to the cap
+#   FAKE_LGC_RC=0             exit status of -lgc
+#   FAKE_LGC_FAIL_FROM=0      every -lgc call with number >= N fails
+#   FAKE_LGC_FAIL_RC=4        status of those later failures
+#   FAKE_LGC_STDERR=""        stderr printed by -lgc
+#   FAKE_RGC_RC=0             exit status of -rgc
+#   FAKE_RGC_FAIL_FROM=0      every -rgc call with number >= N fails
+#   FAKE_RGC_FAIL_RC=1        status of those later failures
+#   FAKE_RGC_STDERR=""        stderr printed by -rgc
+#   FAKE_STREAM_UTILS="0"     utilization of each stream tick; last value repeats
+#   FAKE_STREAM_LINES=0       0 = stream until killed, N = N lines then exit
+#   FAKE_STREAM_SLEEP=0.05    seconds between stream lines
+#   FAKE_STREAM_EXIT_RC=0     stream exit status after FAKE_STREAM_LINES
+#   FAKE_STREAM_STDERR=""     stderr printed once when the stream starts
+set -uo pipefail
+
+STATE="${FAKE_STATE:?FAKE_STATE must be set to a writable directory}"
+ARGV_LOG="${FAKE_ARGV_LOG:-$STATE/argv.log}"
+MAX_CLK="${FAKE_MAX_CLK:-1380}"
+IDLE_CLK="${FAKE_CLOCK_IDLE:-1260}"
+START_SLEEP="${FAKE_STREAM_SLEEP:-0.05}"
+
+clock_file() { printf '%s/clock.%s' "$STATE" "$1"; }
+
+clock_of() { # idx -> MHz
+  local f v=""
+  f=$(clock_file "$1")
+  if [ -f "$f" ]; then
+    read -r v < "$f" || v=""
+  fi
+  if [ -z "$v" ]; then v="$IDLE_CLK"; fi
+  printf '%s' "$v"
+}
+
+set_clock() { # idx value
+  printf '%s\n' "$2" > "$(clock_file "$1")"
+}
+
+bump() { # counter name -> new value on stdout
+  local f="$STATE/$1" n=0
+  if [ -f "$f" ]; then
+    read -r n < "$f" || n=0
+  fi
+  n=$(( n + 1 ))
+  printf '%s\n' "$n" > "$f"
+  printf '%s' "$n"
+}
+
+uuid_of() { printf 'GPU-01234567-89ab-cdef-0123-456789abcd%02x' "$1"; }
+
+stream() { # idx arg (comma separated), honouring -i like the real tool
+  local -a gpus=() utils=() req=()
+  local g="" i=0 last=0 util=""
+  IFS=' ,' read -r -a gpus <<< "${FAKE_GPUS:-0}"
+  IFS=' ,' read -r -a utils <<< "${FAKE_STREAM_UTILS:-0}"
+  last=$(( ${#utils[@]} - 1 ))
+  if [ -n "$1" ]; then
+    IFS=',' read -r -a req <<< "$1"
+    gpus=()
+    for util in "${req[@]}"; do
+      util="${util// /}"
+      if [ -n "$util" ]; then gpus+=("$util"); fi
+    done
+  fi
+  if [ -n "${FAKE_STREAM_STDERR:-}" ]; then
+    printf '%s\n' "$FAKE_STREAM_STDERR" >&2
+  fi
+  while :; do
+    if [ "${FAKE_STREAM_LINES:-0}" -gt 0 ] && [ "$i" -ge "${FAKE_STREAM_LINES}" ]; then
+      exit "${FAKE_STREAM_EXIT_RC:-0}"
+    fi
+    if [ "$i" -le "$last" ]; then util="${utils[$i]}"; else util="${utils[$last]}"; fi
+    for g in "${gpus[@]}"; do
+      printf '%s, %s\n' "$g" "$util"
+    done
+    sleep "$START_SLEEP"
+    i=$(( i + 1 ))
+  done
+}
+
+# --- record the call -------------------------------------------------------
+# Tests pre-create the state directory; mkdir is only a convenience.
+if [ ! -d "$STATE" ]; then mkdir -p "$STATE" || true; fi
+printf '%s %s\n' "$(date +%s)" "$*" >> "$ARGV_LOG" || true
+
+# --- parse the parts we emulate -------------------------------------------
+idx=""
+query=""
+action=""
+clamp_range=""
+want_stream=0
+extra=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -i)
+      idx="${2:-}"
+      shift 2 || shift
+      ;;
+    -lgc)
+      action="lgc"
+      clamp_range="${2:-}"
+      shift 2 || shift
+      ;;
+    -rgc)
+      action="rgc"
+      shift
+      ;;
+    --query-gpu=*)
+      query="$1"
+      shift
+      ;;
+    --loop-ms=*)
+      want_stream=1
+      shift
+      ;;
+    *)
+      extra+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "$want_stream" -eq 1 ]; then
+  stream "$idx"
+  exit 0
+fi
+
+if [ "$action" = "lgc" ]; then
+  n=$(bump lgc.count)
+  rc="${FAKE_LGC_RC:-0}"
+  fail_from="${FAKE_LGC_FAIL_FROM:-0}"
+  if [ "$fail_from" -gt 0 ] && [ "$n" -ge "$fail_from" ]; then
+    rc="${FAKE_LGC_FAIL_RC:-4}"
+  fi
+  if [ -n "${FAKE_LGC_STDERR:-}" ]; then
+    printf '%s\n' "$FAKE_LGC_STDERR" >&2
+  fi
+  # A rejected range still exits 0, so "applies" is independent of the status.
+  if [ "$rc" -eq 0 ] && [ "${FAKE_LGC_APPLIES:-1}" = "1" ]; then
+    set_clock "$idx" "${clamp_range#*,}"
+  fi
+  exit "$rc"
+fi
+
+if [ "$action" = "rgc" ]; then
+  n=$(bump rgc.count)
+  rc="${FAKE_RGC_RC:-0}"
+  fail_from="${FAKE_RGC_FAIL_FROM:-0}"
+  if [ "$fail_from" -gt 0 ] && [ "$n" -ge "$fail_from" ]; then
+    rc="${FAKE_RGC_FAIL_RC:-1}"
+  fi
+  if [ -n "${FAKE_RGC_STDERR:-}" ]; then
+    printf '%s\n' "$FAKE_RGC_STDERR" >&2
+  fi
+  if [ "$rc" -eq 0 ]; then set_clock "$idx" "$IDLE_CLK"; fi
+  exit "$rc"
+fi
+
+case "$query" in
+  --query-gpu=index,uuid)
+    IFS=' ,' read -r -a qgpus <<< "${FAKE_GPUS:-0}"
+    for g in "${qgpus[@]}"; do
+      printf '%s, %s\n' "$g" "$(uuid_of "$g")"
+    done
+    exit 0
+    ;;
+  --query-gpu=clocks.max.gr)
+    printf '%s\n' "${MAX_CLK}"
+    exit 0
+    ;;
+  --query-gpu=clocks.gr)
+    printf '%s\n' "$(clock_of "$idx")"
+    exit 0
+    ;;
+esac
+
+# Unknown query: succeed quietly so an accidental extra call is not fatal.
+exit 0

@@ -1,113 +1,483 @@
 #!/usr/bin/env bash
 # nvidia-idle-clock
-# 対象GPUが一定時間アイドルなら -lgc でクロック上限を絞って待機電力を削減し、
-# 利用が始まったら即座に解除する。
+# Clamp the graphics clock range of idle NVIDIA GPUs and release it as soon as
+# the GPU is used again.
 #
-# V100 では NvAPI の PState 強制が一切効かない(fallback=0 で全PStateが NVAPI_ERROR)
-# ため、クロック範囲ロックで代用している。
-# 実測: クランプ中は計算0.089倍/帯域0.12-0.19倍だが、解除で完全に元に戻る
-#       (SGEMM 12.36TFLOP/s, DtoD 1024GB/s が誤差0.01%で復帰)。
-# 効くのは VRAM を保持している間だけ。VRAM が空なら driver が自分で 135MHz まで
-# 落ちるのでクランプ不要 (実測でクランプ有無の差は 0.0W)。逆に VRAM を保持して
-# いる間は driver が降りない (1260MHz/41W のまま 180秒経過を確認) ため、そこを狙う。
-# SKIP_IF_LOW=1 は既に低クロックでアイドルしている GPU に無駄なロックを当てない判定。
+# Why a clock range lock: on V100, forcing a PState through NvAPI does not work
+# (every PState returns NVAPI_ERROR with fallback=0), so a graphics clock range
+# lock is used instead. Measured while locked: 0.089x compute and 0.12-0.19x
+# bandwidth, and both recover exactly on release (SGEMM 12.36 TFLOP/s and DtoD
+# 1024 GB/s come back within 0.01%).
 #
-# GPU ごとに独立して動かす場合は systemd テンプレート
-#   nvidia-idle-clock@<GPU index>.service
-# として起動する (Environment=GPU=%i)。1インスタンス1GPUが基本。
+# It only helps while VRAM is held: with an empty VRAM the driver already drops
+# to 135 MHz by itself, so the clamp adds nothing (measured 0.0 W difference).
+# With VRAM held the driver does not drop (1260 MHz / 41 W for at least 180 s),
+# which is the case this daemon targets. SKIP_IF_LOW=1 avoids locking a GPU that
+# already idles at a low clock.
+#
+# The normal deployment is one instance per GPU:
+#   nvidia-idle-clock@<GPU index>.service   (Environment=GPU=%i)
 set -uo pipefail
 
-GPU="${GPU:-0}"                        # 対象GPU (nvidia-smi index, カンマ区切り可)
-IDLE_CAP="${IDLE_CAP:-135}"            # 待機時にクランプする上限クロック MHz
-MIN_CLK="${MIN_CLK:-135}"              # 下限 (V100の最小は135)
-IDLE_SECONDS="${IDLE_SECONDS:-30}"     # この秒数アイドルが続いたらクランプ
-SAMPLE_MS="${SAMPLE_MS:-200}"          # 利用率サンプリング間隔 ms
-UTIL_THRESHOLD="${UTIL_THRESHOLD:-0}"  # これ以下の利用率をアイドルとみなす %
-REASSERT_SECONDS="${REASSERT_SECONDS:-30}" # クランプ再適用の間隔 s
-SKIP_IF_LOW="${SKIP_IF_LOW:-1}"        # 既に低クロックならクランプしない
+# --- tunables (environment / systemd drop-ins) -----------------------------
+GPU="${GPU:-0}"                        # target: comma separated index or UUID
+IDLE_CAP="${IDLE_CAP:-135}"            # upper clock while idle (MHz)
+MIN_CLK="${MIN_CLK:-135}"              # lower clock of the lock (MHz, V100 min is 135)
+IDLE_SECONDS="${IDLE_SECONDS:-30}"     # idle time before clamping (s)
+SAMPLE_MS="${SAMPLE_MS:-200}"          # utilization sampling interval (ms)
+UTIL_THRESHOLD="${UTIL_THRESHOLD:-0}"  # utilization <= this counts as idle (%)
+REASSERT_SECONDS="${REASSERT_SECONDS:-30}" # re-apply the lock this often while locked (s)
+SKIP_IF_LOW="${SKIP_IF_LOW:-1}"        # do not clamp a GPU that already idles low
+NVSMI="${NVSMI:-}"                     # nvidia-smi path; empty = resolve from PATH
 
-NVSMI=/usr/bin/nvidia-smi
+# Time the driver needs before clocks.gr reflects a new clock range. nvidia-smi
+# accepts a range asynchronously, so an immediate read-back can be stale.
+SETTLE_S=0.3
+# Utilization stream reconnect backoff: 2,4,8,16,30 s. Reset as soon as a
+# connection delivers samples.
+RETRY_MIN_S=2
+RETRY_MAX_S=30
 
-log() { echo "$(date '+%F %T') $*"; }
+# --- logging ---------------------------------------------------------------
+# Collapse nvidia-smi stderr into a bounded single-line field: it can be
+# multi-line and long, and one event must stay one line.
+oneline() {
+  local s="$1"
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\t'/ }"
+  while [[ "$s" == *"  "* ]]; do s="${s//  / }"; done
+  s="${s# }"
+  s="${s% }"
+  if [ "${#s}" -gt 240 ]; then s="${s:0:240}..."; fi
+  printf '%s' "$s"
+}
 
-# --- 対象GPUの検証 (存在しない index は除外) ---------------------------
-REQUESTED="${GPU// /}"
-EXISTING=$("$NVSMI" --query-gpu=index --format=csv,noheader,nounits 2>/dev/null \
-           | tr -d ' ' | paste -sd, -)
-IDLIST=""
-for g in ${REQUESTED//,/ }; do
-  case ",$EXISTING," in
-    *",$g,"*) IDLIST="${IDLIST:+$IDLIST }$g" ;;
-    *) log "警告: GPU $g は存在しません。対象から除外します (存在: ${EXISTING:-none})" ;;
+# level=info|warn|error msg="<stable event>" key=value ... on stdout, English
+# only. No timestamp: journald adds one, and a plain stdout line cannot set a
+# syslog priority, so the severity is a field (issue #29).
+log() {
+  local level="$1" msg="$2" line field
+  shift 2
+  line="level=$level msg=\"$msg\""
+  # Fields are joined one by one instead of via "$*": a trap handler can run
+  # while `while IFS= read` still has its temporary IFS in effect, and "$*"
+  # would then concatenate the fields with no separator.
+  for field in "$@"; do line+=" $field"; done
+  printf '%s\n' "$line"
+}
+
+# --- configuration validation ----------------------------------------------
+# Fatal configuration errors exit 2 before the EXIT trap exists, so the status is
+# not rewritten by cleanup (issue #4).
+die_config() { # var value reason
+  log error "invalid config" "var=$1" "value=\"$(oneline "$2")\"" "reason=\"$(oneline "$3")\""
+  exit 2
+}
+
+is_uint() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; return 0; }
+
+# Reject anything that is not plain decimal ("10%", "30s", "-1", " 1"), and cap
+# the digit count so bash arithmetic cannot overflow on absurd input. This is
+# what kept `UTIL_THRESHOLD=10%` from turning every sample into "idle" (issue #3).
+need_uint() { # name value min max
+  local name="$1" value="$2" min="$3" max="$4"
+  is_uint "$value" || die_config "$name" "$value" "not a non-negative integer"
+  if [ "${#value}" -gt 9 ] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+    die_config "$name" "$value" "out of range ${min}..${max}"
+  fi
+}
+
+# A GPU selector is an index or a UUID. Validated per element: the old
+# `for g in ${GPU//,/ }` word-split and globbed, so GPU='*' expanded to the files
+# of the current directory (issue #3).
+is_gpu_token() {
+  case "$1" in
+    '') return 1 ;;
+    *[!0-9]*) ;;                    # not a plain index, so it must be a UUID
+    *) return 0 ;;
   esac
+  case "$1" in
+    GPU-*) [[ "$1" =~ ^GPU-[0-9A-Za-z]{8}(-[0-9A-Za-z]{4}){3}-[0-9A-Za-z]{12}$ ]] ;;
+    MIG-*) [[ "$1" =~ ^MIG-[0-9A-Za-z/_-]+$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+need_uint SAMPLE_MS "$SAMPLE_MS" 50 60000
+need_uint UTIL_THRESHOLD "$UTIL_THRESHOLD" 0 100
+need_uint MIN_CLK "$MIN_CLK" 1 100000
+need_uint IDLE_CAP "$IDLE_CAP" 1 100000
+need_uint IDLE_SECONDS "$IDLE_SECONDS" 0 86400
+need_uint REASSERT_SECONDS "$REASSERT_SECONDS" 1 86400
+need_uint SKIP_IF_LOW "$SKIP_IF_LOW" 0 1
+[ "$MIN_CLK" -le "$IDLE_CAP" ] \
+  || die_config MIN_CLK "$MIN_CLK" "must not be greater than IDLE_CAP ($IDLE_CAP)"
+
+[ -n "${GPU// /}" ] || die_config GPU "$GPU" "empty"
+GPU_TOKENS=()
+IFS=',' read -r -a _raw_tokens <<< "$GPU"
+for _tok in "${_raw_tokens[@]}"; do
+  _tok="${_tok// /}"
+  is_gpu_token "$_tok" || die_config GPU "$GPU" "element '$_tok' is not a GPU index or UUID"
+  GPU_TOKENS+=("$_tok")
 done
-if [ -z "$IDLIST" ]; then
-  log "エラー: 有効なGPUがありません (指定: ${REQUESTED:-none} / 存在: ${EXISTING:-none})"
+unset _raw_tokens _tok
+
+# --- nvidia-smi ------------------------------------------------------------
+# Resolved after log() exists so a failure can be logged (issue #15). An
+# explicit NVSMI wins and must be executable: a wrong path is a configuration
+# mistake and must not be papered over by silently picking another binary.
+# When unset, resolve from PATH (this is what works on NixOS and under any
+# prefix, and matches install.sh/uninstall.sh), leaving /usr/bin/nvidia-smi as a
+# last resort for units that run with a minimal PATH.
+if [ -z "$NVSMI" ]; then
+  NVSMI=$(command -v nvidia-smi 2>/dev/null || true)
+  if [ -z "$NVSMI" ]; then NVSMI=/usr/bin/nvidia-smi; fi
+fi
+if [ ! -x "$NVSMI" ]; then
+  log error "nvidia-smi not found" "nvidia_smi=$NVSMI" \
+    "hint=\"set NVSMI=/path/to/nvidia-smi or add nvidia-smi to PATH\""
   exit 1
 fi
-IDS="${IDLIST// /,}"
 
-unlock_all() { for g in $IDLIST; do "$NVSMI" -i "$g" -rgc >/dev/null 2>&1; done; }
-
-cleanup() {
-  trap - INT TERM EXIT
-  unlock_all
-  log "終了: gpu=$IDS のクロックロックを解除"
-  exit 0
+# yes/no helper: comma separated list, "none" when empty.
+csv() {
+  local out="" sep="" item
+  for item in "$@"; do
+    out+="${sep}${item}"
+    sep=","
+  done
+  if [ -z "$out" ]; then out="none"; fi
+  printf '%s' "$out"
 }
-trap cleanup INT TERM EXIT
 
-log "開始 gpu=$IDS cap=${MIN_CLK}-${IDLE_CAP}MHz idle=${IDLE_SECONDS}s sample=${SAMPLE_MS}ms skip_if_low=$SKIP_IF_LOW"
-unlock_all
+# --- target GPU selection --------------------------------------------------
+# One query for existence and UUID -> index mapping: the utilization stream
+# reports indices, so UUID selectors are normalised here.
+INDEXES=()
+UUIDS=()
+_gpu_lines=$("$NVSMI" --query-gpu=index,uuid --format=csv,noheader,nounits 2>&1)
+_rc=$?
+if [ "$_rc" -ne 0 ]; then
+  log error "gpu query failed" "rc=$_rc" "stderr=\"$(oneline "$_gpu_lines")\""
+  exit 1
+fi
+while IFS= read -r _line; do
+  [ -n "$_line" ] || continue
+  _idx="${_line%%,*}"
+  _uuid=""
+  case "$_line" in
+    *,*) _uuid="${_line#*,}" ;;
+  esac
+  _idx="${_idx// /}"
+  _uuid="${_uuid// /}"
+  is_uint "$_idx" || continue
+  INDEXES+=("$_idx")
+  UUIDS+=("$_uuid")
+done <<< "$_gpu_lines"
+if [ "${#INDEXES[@]}" -eq 0 ]; then
+  log error "no usable gpu" "requested=$GPU" "known=none"
+  exit 1
+fi
 
-declare -A LOCKED=() IDLE=() ASSERTED=()
-for g in $IDLIST; do LOCKED[$g]=0; IDLE[$g]=0; ASSERTED[$g]=0; done
+GPU_IDS=()
+for _tok in "${GPU_TOKENS[@]}"; do
+  _pick=""
+  for _i in "${!INDEXES[@]}"; do
+    if is_uint "$_tok"; then
+      if [ "${INDEXES[$_i]}" -eq "$_tok" ]; then _pick="${INDEXES[$_i]}"; break; fi
+    elif [ "${UUIDS[$_i],,}" = "${_tok,,}" ]; then
+      _pick="${INDEXES[$_i]}"
+      break
+    fi
+  done
+  if [ -z "$_pick" ]; then
+    log warn "gpu not found" "gpu=$_tok" "known=$(csv "${INDEXES[@]}")"
+    continue
+  fi
+  for _seen in "${GPU_IDS[@]+"${GPU_IDS[@]}"}"; do
+    if [ "$_seen" = "$_pick" ]; then _pick=""; break; fi
+  done
+  if [ -n "$_pick" ]; then GPU_IDS+=("$_pick"); fi
+done
+unset _gpu_lines _line _idx _uuid _i _seen _pick
+if [ "${#GPU_IDS[@]}" -eq 0 ]; then
+  log error "no usable gpu" "requested=$GPU" "known=$(csv "${INDEXES[@]}")"
+  exit 1
+fi
+IDS=$(csv "${GPU_IDS[@]}")
 
-while true; do
+# clocks.max.gr is read once per selected GPU. A range above it is rejected by
+# the driver with rc=0 ("Treating as warning"), so refuse to start instead of
+# pretending a clamp works (issue #1).
+for _g in "${GPU_IDS[@]}"; do
+  _max=$("$NVSMI" -i "$_g" --query-gpu=clocks.max.gr --format=csv,noheader,nounits 2>/dev/null)
+  _max="${_max//[^0-9]/}"
+  if [ -z "$_max" ]; then
+    log warn "clocks.max.gr unavailable" "gpu=$_g"
+    continue
+  fi
+  if [ "$IDLE_CAP" -gt "$_max" ]; then
+    die_config IDLE_CAP "$IDLE_CAP" "exceeds clocks.max.gr ($_max) of gpu $_g"
+  fi
+done
+unset _g _max
+
+# --- per-GPU state ---------------------------------------------------------
+# LOCKED      1 when we have verified a clock range lock
+# IDLE_MS     accumulated idle time
+# ASSERT_MS   time since the last successful re-assert
+# CLAMP_FAIL  consecutive failed idle clamp attempts (drives the backoff)
+# RETRY_MS    remaining backoff before the next clamp attempt
+# REASSERT_FAIL  a re-assert failure was already logged (one line per streak)
+# UNLOCK_FAIL    an unlock failure was already logged
+declare -A LOCKED=() IDLE_MS=() ASSERT_MS=() CLAMP_FAIL=() RETRY_MS=()
+declare -A REASSERT_FAIL=() UNLOCK_FAIL=()
+for g in "${GPU_IDS[@]}"; do
+  LOCKED[$g]=0
+  IDLE_MS[$g]=0
+  ASSERT_MS[$g]=0
+  CLAMP_FAIL[$g]=0
+  RETRY_MS[$g]=0
+  REASSERT_FAIL[$g]=0
+  UNLOCK_FAIL[$g]=0
+done
+
+# --- nvidia-smi helpers ----------------------------------------------------
+read_clock() { # index -> MHz digits, empty when unreadable
+  local out
+  out=$("$NVSMI" -i "$1" --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null)
+  out="${out//[^0-9]/}"
+  printf '%s' "$out"
+}
+
+backoff_seconds() { # consecutive failures -> 5,10,20,40,60,60...
+  local n="$1" s=5 i
+  for (( i = 1; i < n; i++ )); do
+    s=$(( s * 2 ))
+    if [ "$s" -ge 60 ]; then s=60; break; fi
+  done
+  printf '%s' "$s"
+}
+
+# One failure line per failing streak: a rejected clamp used to be silent and
+# re-forked nvidia-smi on every sample (issue #2).
+note_clamp_failure() { # index trigger rc observed stderr
+  local idx="$1" trigger="$2" rc="$3" observed="$4" err="$5" attempt retry
+  if [ "$trigger" = "reassert" ]; then
+    if [ "${REASSERT_FAIL[$idx]}" -eq 1 ]; then return 0; fi
+    REASSERT_FAIL[$idx]=1
+    log warn "clamp reassert failed" "gpu=$idx" "trigger=reassert" "rc=$rc" \
+      "observed_mhz=${observed:-?}" "stderr=\"$(oneline "$err")\""
+    return 0
+  fi
+  CLAMP_FAIL[$idx]=$(( ${CLAMP_FAIL[$idx]} + 1 ))
+  if [ "${CLAMP_FAIL[$idx]}" -gt 1 ]; then return 0; fi
+  attempt="${CLAMP_FAIL[$idx]}"
+  retry=$(backoff_seconds "$attempt")
+  if [ "$rc" -eq 0 ]; then
+    log error "clamp not applied" "gpu=$idx" "trigger=idle" "rc=$rc" "attempt=$attempt" \
+      "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" "observed_mhz=${observed:-?}" \
+      "retry_s=$retry" "stderr=\"$(oneline "$err")\""
+  else
+    log error "clamp failed" "gpu=$idx" "trigger=idle" "rc=$rc" "attempt=$attempt" \
+      "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" "retry_s=$retry" \
+      "stderr=\"$(oneline "$err")\""
+  fi
+}
+
+apply_clamp() { # index trigger was_mhz
+  local idx="$1" trigger="$2" was="$3" err rc observed
+  # stderr is captured, not discarded: it is the only diagnosis available when
+  # the driver refuses the request (issues #1, #2).
+  err=$("$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    note_clamp_failure "$idx" "$trigger" "$rc" "" "$err"
+    return 1
+  fi
+  # nvidia-smi reports success even when it rejects the range, so a read-back
+  # after a short settle is the only evidence the clamp is in effect (issue #1).
+  sleep "$SETTLE_S"
+  observed=$(read_clock "$idx")
+  if [ -z "$observed" ] || [ "$observed" -gt "$IDLE_CAP" ]; then
+    note_clamp_failure "$idx" "$trigger" 0 "$observed" "$err"
+    return 1
+  fi
+  if [ "$trigger" = "idle" ]; then
+    CLAMP_FAIL[$idx]=0
+    log info "clamp verified" "gpu=$idx" "trigger=idle" "was_mhz=${was:-?}" \
+      "observed_mhz=$observed" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP"
+  elif [ "${REASSERT_FAIL[$idx]}" -eq 1 ]; then
+    # A periodic re-assert is silent unless it proves a previous failure wrong.
+    REASSERT_FAIL[$idx]=0
+    log info "clamp verified" "gpu=$idx" "trigger=reassert" "observed_mhz=$observed" \
+      "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP"
+  fi
+  return 0
+}
+
+# success sets LOCKED=0; failure keeps it at 1 so the caller retries later, and
+# is logged once per streak so a persistently failing -rgc stays visible without
+# filling the journal (issue #6).
+unlock_gpu() { # index trigger [util_pct]
+  local idx="$1" trigger="$2" util="${3:-}" err rc
+  err=$("$NVSMI" -i "$idx" -rgc 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    LOCKED[$idx]=0
+    ASSERT_MS[$idx]=0
+    REASSERT_FAIL[$idx]=0
+    UNLOCK_FAIL[$idx]=0
+    case "$trigger" in
+      util) log info "unlocked" "gpu=$idx" "trigger=util" "util_pct=${util:-?}" ;;
+      exit) log info "unlocked" "gpu=$idx" "trigger=exit" ;;
+    esac
+    return 0
+  fi
+  if [ "${UNLOCK_FAIL[$idx]}" -eq 0 ]; then
+    UNLOCK_FAIL[$idx]=1
+    log warn "unlock failed" "gpu=$idx" "trigger=$trigger" "rc=$rc" \
+      "stderr=\"$(oneline "$err")\""
+  fi
+  return 1
+}
+
+unlock_all() { # trigger
+  local g failed=0
+  for g in "${GPU_IDS[@]}"; do
+    if ! unlock_gpu "$g" "$1" ""; then failed=1; fi
+  done
+  return "$failed"
+}
+
+# --- shutdown --------------------------------------------------------------
+# The exit status is captured by the trap and handed back unchanged, so a fatal
+# error reaches systemd as a failure and `Restart=on-failure` works. A SIGTERM /
+# SIGINT stop is deliberate and starts from 0; if the -rgc reset then fails the
+# stop is reported as failed, because the GPU is left clamped (issues #4, #6).
+# Nothing reachable from a trap handler may depend on IFS or word splitting: a
+# trap can run while the temporary IFS of `while IFS= read` is still active.
+cleanup() { # status to preserve
+  local rc="$1" unlocked=0
+  trap - INT TERM EXIT
+  if [ -n "$STREAM_ERR" ] && [ "$STREAM_ERR" != "/dev/null" ]; then rm -f "$STREAM_ERR"; fi
+  if unlock_all exit; then unlocked=1; fi
+  if [ "$unlocked" -eq 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
+  if [ "$unlocked" -eq 1 ]; then
+    log info "exit" "gpu=$IDS" "rc=$rc"
+  else
+    log error "exit" "gpu=$IDS" "rc=$rc" "reason=unlock_failed"
+  fi
+  exit "$rc"
+}
+
+# stdbuf is optional: a real nvidia-smi flushes every --loop-ms, and making it a
+# hard dependency turned a missing tool into a silent reconnect loop (issue #24).
+STDBUF_LIST=()
+if command -v stdbuf >/dev/null 2>&1; then STDBUF_LIST=(stdbuf -oL); fi
+
+# First stderr line of the utilization stream, so a missing driver or tool is
+# visible instead of being discarded.
+STREAM_ERR=$(mktemp "${TMPDIR:-/tmp}/nvidia-idle-clock.XXXXXX" 2>/dev/null) || STREAM_ERR=/dev/null
+RETRY_S=$RETRY_MIN_S
+STREAM_LOGGED=0
+LAST_STREAM_ERR=""
+
+trap 'cleanup $?' EXIT
+trap 'cleanup 0' INT TERM
+
+# Clear a lock left behind by a previous run before the first decision.
+unlock_all startup
+
+log info "started" "gpu=$IDS" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" \
+  "idle_s=$IDLE_SECONDS" "sample_ms=$SAMPLE_MS" \
+  "util_threshold_pct=$UTIL_THRESHOLD" "reassert_s=$REASSERT_SECONDS" \
+  "skip_if_low=$SKIP_IF_LOW" "nvidia_smi=$NVSMI"
+
+while :; do
+  STREAM_SAMPLES=0
   while IFS= read -r line; do
-    idx="${line%%,*}"; util="${line#*,}"
-    idx="${idx//[^0-9]/}"; util="${util//[^0-9]/}"
-    if [ -z "$idx" ] || [ -z "$util" ]; then continue; fi
-    if [ -z "${LOCKED[$idx]+x}" ]; then continue; fi
+    index="${line%%,*}"
+    util="${line#*,}"
+    index="${index//[^0-9]/}"
+    util="${util//[^0-9]/}"
+    if [ -z "$index" ] || [ -z "$util" ]; then continue; fi
+    if [ -z "${LOCKED[$index]+x}" ]; then continue; fi
+    STREAM_SAMPLES=$(( STREAM_SAMPLES + 1 ))
 
     if [ "$util" -gt "$UTIL_THRESHOLD" ]; then
-      if [ "${LOCKED[$idx]}" -eq 1 ]; then
-        if "$NVSMI" -i "$idx" -rgc >/dev/null 2>&1; then LOCKED[$idx]=0; fi
-        log "gpu$idx 活動検出 (util=${util}%): ロック解除"
-      fi
-      IDLE[$idx]=0; ASSERTED[$idx]=0
+      IDLE_MS[$index]=0
+      ASSERT_MS[$index]=0
+      CLAMP_FAIL[$index]=0
+      RETRY_MS[$index]=0
+      if [ "${LOCKED[$index]}" -eq 1 ]; then unlock_gpu "$index" util "$util"; fi
       continue
     fi
 
-    IDLE[$idx]=$(( ${IDLE[$idx]} + SAMPLE_MS ))
+    # Backoff after a failed clamp: do not fork nvidia-smi for every sample
+    # while the request keeps being rejected (issue #2).
+    if [ "${RETRY_MS[$index]}" -gt 0 ]; then
+      RETRY_MS[$index]=$(( ${RETRY_MS[$index]} - SAMPLE_MS ))
+      continue
+    fi
 
-    if [ "${LOCKED[$idx]}" -eq 1 ]; then
-      ASSERTED[$idx]=$(( ${ASSERTED[$idx]} + SAMPLE_MS ))
-      if [ "${ASSERTED[$idx]}" -ge $(( REASSERT_SECONDS * 1000 )) ]; then
-        "$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" >/dev/null 2>&1
-        ASSERTED[$idx]=0
+    IDLE_MS[$index]=$(( ${IDLE_MS[$index]} + SAMPLE_MS ))
+
+    if [ "${LOCKED[$index]}" -eq 1 ]; then
+      ASSERT_MS[$index]=$(( ${ASSERT_MS[$index]} + SAMPLE_MS ))
+      if [ "${ASSERT_MS[$index]}" -ge $(( REASSERT_SECONDS * 1000 )) ]; then
+        ASSERT_MS[$index]=0
+        # LOCKED stays 1 on purpose: a failed re-assert is retried on the next
+        # interval instead of turning into a per-sample retry loop.
+        apply_clamp "$index" reassert ""
       fi
       continue
     fi
 
-    if [ "${IDLE[$idx]}" -lt $(( IDLE_SECONDS * 1000 )) ]; then continue; fi
+    if [ "${IDLE_MS[$index]}" -lt $(( IDLE_SECONDS * 1000 )) ]; then continue; fi
 
-    cur=""
+    was=""
     if [ "$SKIP_IF_LOW" = "1" ]; then
-      cur=$("$NVSMI" -i "$idx" --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null)
-      cur="${cur//[^0-9]/}"
+      was=$(read_clock "$index")
+      # The driver already idles low, so a lock cannot save anything.
+      if [ -n "$was" ] && [ "$was" -le "$IDLE_CAP" ]; then
+        IDLE_MS[$index]=0
+        continue
+      fi
     fi
-    if [ "$SKIP_IF_LOW" = "1" ] && [ -n "$cur" ] && [ "$cur" -le "$IDLE_CAP" ]; then
-      IDLE[$idx]=0                      # ドライバが既に十分低い -> 何もしない
-      continue
-    fi
-    if "$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" >/dev/null 2>&1; then
-      LOCKED[$idx]=1; ASSERTED[$idx]=0
-      log "gpu$idx アイドル ${IDLE_SECONDS}s 継続 (${cur:-?}MHz): ${MIN_CLK}-${IDLE_CAP}MHz にクランプ"
-    fi
-  done < <(stdbuf -oL "$NVSMI" -i "$IDS" --query-gpu=index,utilization.gpu \
-             --format=csv,noheader,nounits --loop-ms="$SAMPLE_MS" 2>/dev/null)
 
-  log "利用率ストリームが切れました。2秒後に再接続します"
-  sleep 2
+    if apply_clamp "$index" idle "$was"; then
+      LOCKED[$index]=1
+      ASSERT_MS[$index]=0
+    else
+      RETRY_MS[$index]=$(( $(backoff_seconds "${CLAMP_FAIL[$index]}") * 1000 ))
+    fi
+  done < <( "${STDBUF_LIST[@]+"${STDBUF_LIST[@]}"}" "$NVSMI" -i "$IDS" \
+             --query-gpu=index,utilization.gpu --format=csv,noheader,nounits \
+             --loop-ms="$SAMPLE_MS" 2>"$STREAM_ERR" )
+
+  # The stream ended. Report the one reason we have, then back off instead of
+  # reconnecting every 2 s forever (issue #24).
+  first_err=""
+  if [ -n "$STREAM_ERR" ] && [ -s "$STREAM_ERR" ]; then
+    IFS= read -r first_err < "$STREAM_ERR" || true
+    : > "$STREAM_ERR"
+  fi
+  first_err=$(oneline "$first_err")
+  if [ "$STREAM_SAMPLES" -gt 0 ]; then RETRY_S=$RETRY_MIN_S; fi
+  if [ "$STREAM_SAMPLES" -gt 0 ] || [ "$first_err" != "$LAST_STREAM_ERR" ] \
+       || [ "$STREAM_LOGGED" -eq 0 ]; then
+    log warn "stream lost" "retry_s=$RETRY_S" "stderr=\"$first_err\""
+    STREAM_LOGGED=1
+    LAST_STREAM_ERR="$first_err"
+  fi
+  # A foreground sleep defers signal handling until it returns; waiting on a
+  # background sleep lets the TERM trap run immediately, so a stop is not delayed
+  # by up to RETRY_MAX_S.
+  sleep "$RETRY_S" &
+  wait $!
+  RETRY_S=$(( RETRY_S * 2 ))
+  if [ "$RETRY_S" -gt "$RETRY_MAX_S" ]; then RETRY_S=$RETRY_MAX_S; fi
 done
