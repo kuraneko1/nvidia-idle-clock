@@ -10,8 +10,8 @@ set -euo pipefail
 # inside a step helper, not only at the top level.
 set -E
 
-# Installer version. Bumped together with the release tag (v0.2.3).
-INSTALLER_VERSION="0.2.3"
+# Installer version. Bumped together with the release tag (v0.2.4).
+INSTALLER_VERSION="0.2.4"
 
 PROG="$(basename -- "$0")"
 SELF_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"

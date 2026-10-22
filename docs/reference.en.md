@@ -238,7 +238,7 @@ usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run] [-u|--unlock]
 | Option | Effect |
 |---|---|
 | `-h`, `--help` | print usage and exit |
-| `-V`, `--version` | print `nvidia-idle-clock 0.2.3` and exit |
+| `-V`, `--version` | print `nvidia-idle-clock 0.2.4` and exit |
 | `-n`, `--dry-run` | validate the configuration, print the resolved plan and exit; never calls `-lgc` / `-rgc` |
 | `-u`, `--unlock` | release only the GPUs that carry a state marker and exit (see below) |
 | none | run the daemon in the foreground (systemd `Type=simple`) |

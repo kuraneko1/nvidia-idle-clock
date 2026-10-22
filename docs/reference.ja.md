@@ -233,7 +233,7 @@ usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run] [-u|--unlock]
 | オプション | 動作 |
 |---|---|
 | `-h`, `--help` | 使い方を表示して終了 |
-| `-V`, `--version` | `nvidia-idle-clock 0.2.3` を表示して終了 |
+| `-V`, `--version` | `nvidia-idle-clock 0.2.4` を表示して終了 |
 | `-n`, `--dry-run` | 設定を検証し、解決後のプランを表示して終了。`-lgc` / `-rgc` は呼ばない |
 | `-u`, `--unlock` | マーカーのある GPU だけを `-rgc` で解除して終了 (下記) |
 | なし | フォアグラウンドでデーモンとして動く (systemd `Type=simple`) |

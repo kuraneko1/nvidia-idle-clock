@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-10-22
+
+Documentation release: the README now states its limits and its footguns up front. No code change.
+
+### Changed
+
+- **Limits before the install steps.** Linux + systemd + Volta/sm70 only; V100-PCIE-32GB and
+  PG500-216 are the only verified parts; newer generations are unsupported (the daemon refuses an
+  out-of-range cap and never reports a clamp it could not verify); bash 4.2+, root for the install.
+- **`30-second demo`.** A copy-paste, service-free walkthrough: hold 512 MiB of VRAM with an idle
+  process, watch clocks and power, run the daemon in the foreground with `IDLE_SECONDS=5`, then let
+  it release on Ctrl-C or on any kernel launch.
+- **`Do not` / `やってはいけないこと`.** Nine explicit don'ts: shared GPUs, non-V100 hardware,
+  Windows/macOS/WSL/no-systemd containers, permanently busy GPUs, latency-critical use, two
+  instances on one GPU, MIG, hand-editing the installed binary, and treating `--keep-clocks` as a
+  permanent setting.
+- **Requirements** now list systemd (255 tested; older releases warn on unknown sandbox
+  directives), the driver's `-lgc`, coreutils, optional `flock`, and the root requirement.
+
 ## [0.2.3] - 2026-10-22
 
 Documentation release: bilingual figures. No code change.
