@@ -61,16 +61,24 @@ ExecStartPre=/bin/sh -c 'case "%i" in ""|*[!0-9]*) echo "nvidia-idle-clock: inva
 # node yet. Unlike a condition this is retried by Restart=on-failure, see the
 # start-limit budget in [Unit]. Runs after the instance check so a permanent
 # configuration error is reported as such even while the device is missing.
-ExecStartPre=/usr/bin/test -e /dev/nvidiactl
+# The check goes through /bin/sh and not /usr/bin/test: ExecStartPre needs an
+# absolute path, /bin/sh is required by the FHS while a coreutils at /usr/bin is
+# not (NixOS has no /usr at all). A helper the host does not have would fail the
+# unit with 203/EXEC instead of answering "is the driver there yet".
+ExecStartPre=/bin/sh -c 'test -e /dev/nvidiactl'
 
 ExecStart=/usr/local/sbin/nvidia-idle-clock
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=20s
-# A GPU that another instance already manages is a configuration mistake, not a
-# transient fault: the daemon exits 3 and nothing was touched. Without this,
-# Restart=on-failure would retry it 30 times and only then report the failure.
-RestartPreventExitStatus=3
+# A permanent mistake must not be retried: exit 3 means another instance already
+# manages this GPU, exit 2 means the configuration or the argument list is
+# invalid (the daemon's die_config and unknown-argument paths). Nothing was
+# touched in either case and a retry can never succeed, so Restart=on-failure
+# would only burn the 30-restart / ~300s budget and repeat the same error line.
+# Both statuses are permanent by construction; a genuine driver or IO failure
+# exits 1 and is still retried.
+RestartPreventExitStatus=2 3
 
 # The daemon releases its own clamp from the EXIT trap, which a SIGKILL, an OOM
 # kill or a stop that reached TimeoutStopSec can never run. This runs after
@@ -78,6 +86,9 @@ RestartPreventExitStatus=3
 # state marker; a GPU this unit never clamped is left alone (#9, #20). The
 # leading "-" keeps a failed release from changing the unit result: the daemon
 # itself already reports failure where it can.
+# The uninstaller's keep-clocks marker covers these stop paths only: a start
+# ignores it and still releases stale markers, so a Restart= or a manual start
+# during --keep-clocks does not preserve the old clamp.
 ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock
 
 # Sandboxing (#10). The unit runs bash + nvidia-smi and logs to the journal, so
