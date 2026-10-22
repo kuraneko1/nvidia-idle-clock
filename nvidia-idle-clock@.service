@@ -18,12 +18,16 @@ ConditionPathExists=/dev/nvidiactl
 After=nvidia-persistenced.service
 After=dev-nvidiactl.device
 
-# Restart budget (#11). 30 attempts at RestartSec=10s span roughly 290s, so a
-# driver that needs tens of seconds no longer ends in a permanently failed
-# unit, while about 5 minutes of continuous failure still stops the loop and
-# leaves the unit failed and visible. The previous 5 attempts / 60s / 5s gave
-# up after ~25s and left the unit failed for the rest of the boot.
-StartLimitIntervalSec=300
+# Restart budget (#11). 30 attempts at RestartSec=10s span roughly 300s, so a
+# driver that needs tens of seconds is no longer left as a permanently failed
+# unit. The interval is deliberately 600s and not 300s: systemd only trips the
+# limit when restarts come faster than StartLimitIntervalSec / StartLimitBurst
+# (20s here), and with 300s/30 a restart every 10s slides through the sliding
+# window indefinitely - a permanent failure would never reach "failed".
+# Measured with the values below: "failed" after 30 restarts at t=300s.
+# The previous 5 attempts / 60s / 5s gave up after ~25s and left one boot-time
+# miss as a failed unit for the rest of that boot.
+StartLimitIntervalSec=600
 StartLimitBurst=30
 
 [Service]
