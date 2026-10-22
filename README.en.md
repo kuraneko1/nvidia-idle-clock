@@ -9,7 +9,7 @@ and `nvidia-smi`.
 
 **Measured: 26.2W saved while VRAM is held (two-card total), 0W when VRAM is empty** → [Measurements](docs/reference.en.md#measurements)
 
-![Measured: 26.2W saved across two cards while VRAM is held (per-GPU average 40.1 → 27.0W), 0W when VRAM is empty (27.3 → 27.2W)](img/hero.png)
+![Measured: 26.2W saved across two cards while VRAM is held (per-GPU average 40.1 → 27.0W), 0W when VRAM is empty (27.3 → 27.2W)](img/en/hero.png)
 
 ## Quick install
 

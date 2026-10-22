@@ -76,7 +76,7 @@ conditions and raw numbers.
 
 ## How it differs from stock
 
-![Clamp/release cycle step chart (PG500-216 / 8GiB in VRAM, schematic): clamped at 135MHz / 27.8W, load is detected and the clock is back at 1260MHz / 39.5W within ≤0.5s, then 30.2s of no load re-clamps it to 135MHz](../img/timeline.png)
+![Clamp/release cycle step chart (PG500-216 / 8GiB in VRAM, schematic): clamped at 135MHz / 27.8W, load is detected and the clock is back at 1260MHz / 39.5W within ≤0.5s, then 30.2s of no load re-clamps it to 135MHz](../img/en/timeline.png)
 
 | | Stock (driver-managed) | With this daemon |
 |---|---|---|
@@ -340,7 +340,7 @@ with 141 clamp events in 24h.
 
 Effectiveness depends on VRAM state.
 
-![Idle-power cards (measured 2026-10-22): 26.2W saved across the two cards — GPU0 37.8W → 25.2W (-12.6W), GPU1 42.4W → 28.9W (-13.6W); per-GPU average with VRAM held 40.1W → 27.0W, with VRAM empty 27.3W → 27.2W (≈0, no saving). Footer: 229.6kWh/year, 8,494 JPY/year at 37 JPY/kWh (Shizuoka example), GPU board power, driver 580.178.04](../img/hero.png)
+![Idle-power cards (measured 2026-10-22): 26.2W saved across the two cards — GPU0 37.8W → 25.2W (-12.6W), GPU1 42.4W → 28.9W (-13.6W); per-GPU average with VRAM held 40.1W → 27.0W, with VRAM empty 27.3W → 27.2W (≈0, no saving). Footer: 229.6kWh/year, 8,494 JPY/year at 37 JPY/kWh (Shizuoka example), GPU board power, driver 580.178.04](../img/en/hero.png)
 
 **Method.** 4 × 600s samples, `nvidia-smi --loop-ms=500`, first 60s dropped. n≈1060–1067
 samples per GPU, stdev 0.05–0.33W. `utilization.gpu` was 0.0 (mean and maximum) in every
@@ -375,7 +375,7 @@ on the same board, so thermal drift cancels.
 
 (PG500-216 / 8GiB in VRAM, 20s each)
 
-![Clamp-ladder cards (PG500-216 / 8GiB in VRAM, 20s each): no clamp 1260MHz / 40.94W, -lgc 135,555 at 555MHz / 31.73W, -lgc 135,300 at 300MHz / 29.52W, -lgc 135,135 at 135MHz / 28.40W](../img/clamp-ladder.png)
+![Clamp-ladder cards (PG500-216 / 8GiB in VRAM, 20s each): no clamp 1260MHz / 40.94W, -lgc 135,555 at 555MHz / 31.73W, -lgc 135,300 at 300MHz / 29.52W, -lgc 135,135 at 135MHz / 28.40W](../img/en/clamp-ladder.png)
 
 | Clamp | Actual clock | Power |
 |---|---|---|
@@ -388,7 +388,7 @@ on the same board, so thermal drift cancels.
 
 (PG500-216 / 8GiB in VRAM)
 
-![Throughput cards while clamped (PG500-216 / 8GiB in VRAM), as a share of the unclamped rate: DtoD copy 19.4%, memset 12.0%, SGEMM 4096 8.9%; after release all are ≈100%, so up to 11× slower while clamped](../img/perf.png)
+![Throughput cards while clamped (PG500-216 / 8GiB in VRAM), as a share of the unclamped rate: DtoD copy 19.4%, memset 12.0%, SGEMM 4096 8.9%; after release all are ≈100%, so up to 11× slower while clamped](../img/en/perf.png)
 
 | Test | No clamp | Clamped @135MHz | After release | Realistic path\* |
 |---|---|---|---|---|
