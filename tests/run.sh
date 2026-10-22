@@ -122,6 +122,12 @@ assert_count() { # name file fixed-string expected
   n=$(grep_count "$2" "$3")
   if [ "$n" -eq "$4" ]; then pass "$1"; else fail "$1" "expected $4 line(s) matching [$3], got $n"; fi
 }
+assert_file_exists() { # name path
+  if [ -e "$2" ]; then pass "$1"; else fail "$1" "$2 does not exist"; fi
+}
+assert_file_gone() { # name path
+  if [ -e "$2" ]; then fail "$1" "$2 still exists"; else pass "$1"; fi
+}
 assert_no_gpu_calls() { # name
   local n=0
   if [ -f "$ARGV" ]; then n=$(wc -l < "$ARGV"); fi
@@ -132,10 +138,14 @@ new_case() { # name
   reap_case_processes
   CASE_DIR="$WORK/$1"
   STATE="$CASE_DIR/state"
+  # The daemon's own state directory (markers and lock files). It is per case on
+  # purpose: the default is /run/nvidia-idle-clock, which this suite must never
+  # touch.
+  DSTATE="$CASE_DIR/daemon-state"
   OUT="$CASE_DIR/out.log"
   ERR="$CASE_DIR/err.log"
   ARGV="$STATE/argv.log"
-  mkdir -p "$STATE"
+  mkdir -p "$STATE" "$DSTATE"
   : > "$OUT"
   : > "$ERR"
 }
@@ -143,7 +153,7 @@ new_case() { # name
 # Foreground run: always points NVSMI at the fake unless the case overrides it.
 run_daemon() { # [NAME=VALUE ...]
   local rc=0 under_test="${SCRIPT_UNDER_TEST:-$SCRIPT}"
-  env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
+  env NVSMI="$FAKE" FAKE_STATE="$STATE" STATE_DIR="$DSTATE" "$@" \
     "$TIMEOUT_BIN" 10 "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" || rc=$?
   RUN_RC=$rc
 }
@@ -156,14 +166,14 @@ start_daemon() { # [NAME=VALUE ...]
   RUN_PID=""
   RUN_PGID=""
   if [ -n "$SETSID_BIN" ]; then
-    env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
+    env NVSMI="$FAKE" FAKE_STATE="$STATE" STATE_DIR="$DSTATE" "$@" \
       "$SETSID_BIN" "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" &
     RUN_PID=$!
     # setsid() and exec in one step: the daemon is a session leader, so its PID
     # is also the process group to reap.
     RUN_PGID=$RUN_PID
   else
-    env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
+    env NVSMI="$FAKE" FAKE_STATE="$STATE" STATE_DIR="$DSTATE" "$@" \
       "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" &
     RUN_PID=$!
   fi
@@ -211,13 +221,13 @@ stop_daemon() { # seconds to run before SIGTERM
 }
 
 # PATH containing everything the daemon and the fake need, and nothing else. Used
-# to prove that stdbuf is optional (issue #24) and that nvidia-smi is resolved
-# from PATH (issue #15).
+# to prove that stdbuf is optional (issue #24), that nvidia-smi is resolved from
+# PATH (issue #15) and that a missing flock(1) does not stop the daemon (#21).
 make_shim() { # dir [extra symlink name:target ...]
   local dir="$1" t pair
   shift
   mkdir -p "$dir"
-  for t in bash env sleep date mktemp rm; do
+  for t in bash env sleep date mktemp rm mkdir chmod; do
     if ln -sf "$(command -v "$t")" "$dir/$t" 2>/dev/null; then :; fi
   done
   for pair in "$@"; do
@@ -396,7 +406,7 @@ case_nvsmi_from_path() {
   new_case nvsmi-path
   make_shim "$shim" "nvidia-smi:$FAKE"
   # NVSMI is deliberately unset: resolution has to come from PATH.
-  env -u NVSMI FAKE_STATE="$STATE" PATH="$shim" \
+  env -u NVSMI FAKE_STATE="$STATE" STATE_DIR="$DSTATE" PATH="$shim" \
     "$BASH_BIN" "$SCRIPT" >>"$OUT" 2>>"$ERR" &
   RUN_PID=$!
   stop_daemon 0.8
@@ -484,9 +494,11 @@ case_clamp_reassert() {
 # --- #6: a failed unlock is never reported as success ----------------------
 case_unlock_failed_activity() {
   new_case unlock-activity
+  # The first -rgc is the release the activity triggers: startup no longer
+  # resets a GPU it never clamped (#20), so there is no earlier call to skip.
   start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 \
     FAKE_STREAM_UTILS='0 0 0 90' \
-    FAKE_RGC_FAIL_FROM=2 \
+    FAKE_RGC_FAIL_FROM=1 \
     FAKE_RGC_STDERR='Unable to reset clocks: GPU is lost'
   stop_daemon 1.8
   assert_has "a failed unlock is reported" "$OUT" 'msg="unlock failed" gpu=0 trigger=util'
@@ -500,11 +512,15 @@ case_unlock_failed_activity() {
 
 case_unlock_failed_stop() {
   new_case unlock-stop
-  start_daemon IDLE_SECONDS=30 FAKE_RGC_RC=1 FAKE_RGC_STDERR='Unable to reset clocks: GPU is lost'
-  stop_daemon 0.7
+  # A clamp has to exist for the stop to have anything to release (#20).
+  start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 FAKE_RGC_RC=1 \
+    FAKE_RGC_STDERR='Unable to reset clocks: GPU is lost'
+  stop_daemon 1.0
+  assert_has "the clamp is in place before the failing stop" "$OUT" 'msg="clamp verified"'
   assert_rc "a deliberate stop with a failed unlock exits non-zero" 1 "$RUN_RC"
   assert_lacks "no unlock success is claimed" "$OUT" 'msg="unlocked"'
   assert_has "the exit line says why" "$OUT" 'reason=unlock_failed'
+  assert_file_exists "a failed release leaves its marker for --unlock" "$DSTATE/gpu0.locked"
 }
 
 # --- #4: the exit status survives the EXIT trap ----------------------------
@@ -525,13 +541,18 @@ case_fatal_status_preserved() {
   assert_rc "a fatal runtime error exits non-zero" 1 "$RUN_RC"
   assert_has "the fatal exit is logged" "$OUT" 'msg="exit" gpu=0 rc=1'
   assert_count "the fatal error exits exactly once" "$OUT" 'msg="exit"' 1
-  assert_has "cleanup still releases clocks on a fatal error" "$ARGV" ' -rgc'
+  # The injected error fires before the first clamp, so there is nothing to
+  # release: -rgc only ever runs for a GPU this instance clamped (#20).
+  assert_lacks "a fatal error before the first clamp resets no clock" "$ARGV" ' -rgc'
 }
 
 # --- #24: stdbuf is optional and stream errors are visible -----------------
 case_stream_without_stdbuf() {
   local shim="$WORK/shim-no-stdbuf"
-  new_case no-stdbuf
+  # The case directory must not be named after stdbuf: the start line carries
+  # the state directory, and the assertion below requires that the literal
+  # string never appears in the log.
+  new_case stream-minimal-path
   make_shim "$shim"
   if [ -x "$shim/stdbuf" ]; then
     fail "the no-stdbuf shim must not contain stdbuf" "unexpected $shim/stdbuf"
@@ -611,17 +632,23 @@ case_sigterm_multigpu_unlock() {
   wrapper=$(make_argv_wrapper "$CASE_DIR/bin")
   argvq="$CASE_DIR/argv-quoted.log"
   : > "$argvq"
-  # SAMPLE_MS/FAKE_STREAM_SLEEP keep the daemon blocked inside `read` when the
-  # signal arrives, which is the state in which a leaked empty IFS used to break
-  # word splitting of the GPU list.
-  start_daemon GPU=0,1 FAKE_GPUS='0 1' IDLE_SECONDS=30 SAMPLE_MS=5000 \
-    FAKE_STREAM_SLEEP=5 \
+  # Both GPUs have to be clamped for the stop to release two clocks. Waiting for
+  # the two clamps (instead of guessing a delay) leaves the daemon blocked inside
+  # `read` with SAMPLE_MS/FAKE_STREAM_SLEEP, which is the state in which a leaked
+  # empty IFS used to break word splitting of the GPU list.
+  start_daemon GPU=0,1 FAKE_GPUS='0 1' IDLE_SECONDS=0 SAMPLE_MS=5000 \
+    SKIP_IF_LOW=1 FAKE_STREAM_SLEEP=5 \
     NVSMI="$wrapper" FAKE_REAL="$FAKE" FAKE_ARGV_QUOTED="$argvq"
-  stop_daemon 0.8
+  if ! wait_for_count "$OUT" 'msg="clamp verified"' 2 60; then
+    fail "both GPUs are clamped before the stop" "no second clamp within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  stop_daemon 0.3
   assert_rc "a multi-GPU stop exits 0" 0 "$RUN_RC"
-  assert_count "the startup and stop unlocks are one -rgc per GPU" "$argvq" '[-rgc]' 4
-  assert_count "gpu 0 is reset with its own -i argument" "$argvq" '[-i] [0] [-rgc]' 2
-  assert_count "gpu 1 is reset with its own -i argument" "$argvq" '[-i] [1] [-rgc]' 2
+  assert_count "exactly one clamp per GPU is released at the stop" "$argvq" '[-rgc]' 2
+  assert_count "gpu 0 is reset with its own -i argument" "$argvq" '[-i] [0] [-rgc]' 1
+  assert_count "gpu 1 is reset with its own -i argument" "$argvq" '[-i] [1] [-rgc]' 1
   assert_lacks "no space-joined GPU list is passed to -i" "$argvq" '[-i] [0 1] [-rgc]'
   assert_lacks "no comma-joined GPU list is passed to -i" "$argvq" '[-i] [0,1] [-rgc]'
   assert_stream_child_gone "the stream child does not outlive a stop" "$STATE/stream.pid"
@@ -733,7 +760,7 @@ run_cli() { # [NAME=VALUE ...] -- [ARG ...]
   local -a envs=()
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   if [ "$#" -gt 0 ]; then shift; fi
-  env NVSMI="$FAKE" FAKE_STATE="$STATE" "${envs[@]+"${envs[@]}"}" \
+  env NVSMI="$FAKE" FAKE_STATE="$STATE" STATE_DIR="$DSTATE" "${envs[@]+"${envs[@]}"}" \
     "$TIMEOUT_BIN" 10 "$BASH_BIN" "$under_test" "$@" >>"$OUT" 2>>"$ERR" || rc=$?
   RUN_RC=$rc
 }
@@ -811,7 +838,203 @@ case_cli_no_args_starts() {
   stop_daemon 0.7
   assert_rc "no arguments starts the daemon" 0 "$RUN_RC"
   assert_has "no arguments reaches the start line" "$OUT" 'msg="started"'
-  assert_ge "no arguments still unlocks clocks at startup" 1 "$(grep_count "$ARGV" ' -rgc')"
+  # #20: startup no longer resets a clock lock that another tool may have set.
+  assert_lacks "a fresh start does not reset a clock it never clamped" "$ARGV" ' -rgc'
+  assert_has "a fresh start reports that it found no stale markers" "$OUT" \
+    'msg="no stale clamp markers"'
+}
+
+# --- #20: only a marker makes a GPU ours to reset -------------------------
+# The marker is the daemon's own record of "I clamped this GPU". Startup must
+# release exactly those and leave every other clock lock (another tool, another
+# instance) alone.
+case_state_dir_created() {
+  new_case state-dir
+  rm -rf "$DSTATE"
+  start_daemon IDLE_SECONDS=30
+  stop_daemon 0.7
+  assert_rc "a run without a state directory starts" 0 "$RUN_RC"
+  assert_file_exists "the daemon creates its state directory" "$DSTATE"
+  assert_eq "the state directory is 0700" 700 "$(stat -c %a "$DSTATE" 2>/dev/null)"
+  assert_has "the start line names the state directory" "$OUT" "state_dir=$DSTATE"
+}
+
+case_state_fresh_run_untouched() {
+  new_case state-fresh
+  start_daemon GPU=0,1 FAKE_GPUS='0 1' IDLE_SECONDS=30
+  stop_daemon 0.7
+  assert_has "a fresh start reports that it found no markers" "$OUT" \
+    'msg="no stale clamp markers"'
+  assert_lacks "a fresh start never resets an unmarked GPU" "$ARGV" ' -rgc'
+  assert_lacks "a fresh start never clamps an idle-threshold GPU" "$ARGV" ' -lgc '
+  assert_file_gone "a fresh start leaves no marker behind" "$DSTATE/gpu0.locked"
+  assert_file_gone "a fresh start leaves no marker behind on gpu 1" "$DSTATE/gpu1.locked"
+}
+
+case_state_stale_marker_only_that_gpu() {
+  new_case state-stale
+  : > "$DSTATE/gpu0.locked"
+  start_daemon GPU=0,1 FAKE_GPUS='0 1' IDLE_SECONDS=30
+  stop_daemon 0.7
+  assert_rc "a start with a stale marker exits 0" 0 "$RUN_RC"
+  assert_has "the stale marker is reported at startup" "$OUT" \
+    'msg="stale clamp markers found" gpu=0'
+  assert_has "the stale clamp is released at startup" "$OUT" \
+    'msg="unlocked" gpu=0 trigger=startup'
+  assert_count "the marked GPU is reset exactly once" "$ARGV" ' -i 0 -rgc' 1
+  assert_lacks "the unmarked GPU is never reset" "$ARGV" ' -i 1 -rgc'
+  assert_file_gone "the stale marker is removed after the release" "$DSTATE/gpu0.locked"
+  assert_file_gone "no marker is invented for the unmarked GPU" "$DSTATE/gpu1.locked"
+}
+
+# --- #9: --unlock is the recovery path a SIGKILL cannot skip ---------------
+case_unlock_cli_marked_only() {
+  new_case unlock-cli
+  : > "$DSTATE/gpu1.locked"
+  run_cli GPU=0,1 FAKE_GPUS='0 1' -- --unlock
+  assert_rc "--unlock exits 0" 0 "$RUN_RC"
+  assert_has "--unlock logs the release" "$OUT" 'msg="unlocked" gpu=1 trigger=unlock'
+  assert_has "--unlock summarises what it released" "$OUT" \
+    'msg="unlock done" gpu=0,1 released=1 rc=0'
+  assert_count "--unlock resets the marked GPU once" "$ARGV" ' -i 1 -rgc' 1
+  assert_lacks "--unlock never resets an unmarked GPU" "$ARGV" ' -i 0 -rgc'
+  assert_lacks "--unlock never clamps" "$ARGV" ' -lgc '
+  assert_file_gone "--unlock removes the marker it released" "$DSTATE/gpu1.locked"
+  # Idempotent: the unit runs this after every stop, including clean ones.
+  run_cli GPU=0,1 FAKE_GPUS='0 1' -- --unlock
+  assert_rc "--unlock with nothing to do exits 0" 0 "$RUN_RC"
+  assert_has "--unlock reports that nothing was released" "$OUT" \
+    'msg="unlock done" gpu=0,1 released=none rc=0'
+  assert_count "--unlock does not reset anything twice" "$ARGV" ' -i 1 -rgc' 1
+}
+
+case_unlock_cli_failure_keeps_marker() {
+  new_case unlock-cli-fail
+  : > "$DSTATE/gpu0.locked"
+  run_cli GPU=0 FAKE_RGC_RC=1 FAKE_RGC_STDERR='Unable to reset clocks: GPU is lost' \
+    -- --unlock
+  assert_rc "a failed -rgc in --unlock exits 1" 1 "$RUN_RC"
+  assert_has "the failed release is an error line" "$OUT" \
+    'level=error msg="unlock failed" gpu=0 trigger=unlock'
+  assert_has "the failed release keeps nvidia-smi stderr" "$OUT" 'Unable to reset clocks'
+  assert_file_exists "a failed release keeps its marker for the next attempt" \
+    "$DSTATE/gpu0.locked"
+}
+
+case_unlock_after_sigkill() {
+  new_case unlock-sigkill
+  start_daemon GPU=0 IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1
+  if ! wait_for_count "$OUT" 'msg="clamp verified"' 1 60; then
+    fail "the daemon clamps before it is killed" "no clamp within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_file_exists "a verified clamp is recorded in the state directory" \
+    "$DSTATE/gpu0.locked"
+  kill -KILL "$RUN_PID" 2>/dev/null
+  wait "$RUN_PID" 2>/dev/null || true
+  RUN_PID=""
+  # A SIGKILL cannot be trapped: the daemon never got to release anything.
+  assert_count "the SIGKILL skipped the daemon's own release" "$OUT" 'trigger=exit' 0
+  # Exactly what the unit runs as ExecStopPost after ANY stop, including this
+  # SIGKILL: the trap never ran, the clamp and its marker are still there.
+  run_cli GPU=0 -- --unlock
+  assert_rc "the ExecStopPost path exits 0 after a SIGKILL" 0 "$RUN_RC"
+  assert_has "the leftover clamp is released" "$OUT" 'msg="unlocked" gpu=0 trigger=unlock'
+  assert_file_gone "the marker is removed after the recovery release" "$DSTATE/gpu0.locked"
+  assert_count "the recovery resets the clamped GPU once" "$ARGV" ' -i 0 -rgc' 1
+}
+
+case_unlock_help() {
+  new_case unlock-help
+  run_cli -- --help
+  assert_rc "--help exits 0" 0 "$RUN_RC"
+  assert_has "--help documents --unlock" "$OUT" '-u, --unlock'
+  assert_has "--help documents the state directory" "$OUT" 'STATE_DIR'
+  assert_has "--help documents the cooldown" "$OUT" 'COOLDOWN_SECONDS'
+  assert_has "--help documents the duplicate-instance exit code" "$OUT" \
+    '3  the GPU is already managed'
+  assert_has "--help documents the unlock-failure exit code" "$OUT" 'unlock failed'
+  assert_no_gpu_calls "--help never runs nvidia-smi"
+}
+
+# --- #18: a release arms a cooldown, a release is never delayed ------------
+case_cooldown_suppresses_then_allows() {
+  new_case cooldown
+  # 0 0 0 0 then 90: idle long enough to clamp, one busy sample, then idle
+  # again. With IDLE_SECONDS=0 the second clamp would happen immediately
+  # without the cooldown.
+  start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 COOLDOWN_SECONDS=2 \
+    FAKE_STREAM_UTILS='0 0 0 0 90 0'
+  if ! wait_for_count "$OUT" 'msg="clamp delayed"' 1 60; then
+    fail "the cooldown suppresses the re-clamp" "no 'clamp delayed' within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_has "the release itself is never delayed" "$OUT" \
+    'msg="unlocked" gpu=0 trigger=util util_pct=90'
+  assert_count "only the first idle window was clamped" "$OUT" 'msg="clamp verified"' 1
+  assert_has "the suppression names its reason" "$OUT" 'msg="clamp delayed" gpu=0 reason=cooldown'
+  assert_has "the suppression reports the remaining seconds" "$OUT" 'remaining_s='
+  assert_count "the suppression is logged once per cooldown" "$OUT" 'msg="clamp delayed"' 1
+  # ... and it must still be suppressed while the cooldown runs.
+  sleep 0.6
+  assert_count "no re-clamp inside the cooldown" "$OUT" 'msg="clamp verified"' 1
+  # ... then allowed again once it expired.
+  wait_for_count "$OUT" 'msg="clamp verified"' 2 60 || true
+  assert_count "the clamp is allowed again after the cooldown" "$OUT" \
+    'msg="clamp verified"' 2
+  assert_count "the expired cooldown is not re-logged" "$OUT" 'msg="clamp delayed"' 1
+  assert_file_exists "the second clamp is recorded in the state directory" \
+    "$DSTATE/gpu0.locked"
+  stop_daemon 0.3
+  assert_rc "the daemon still stops cleanly" 0 "$RUN_RC"
+  assert_file_gone "the stop removes the marker of the second clamp" "$DSTATE/gpu0.locked"
+}
+
+# --- #21: a second instance must not touch a GPU another one manages -------
+case_second_instance_exits_3() {
+  local argv2="$CASE_DIR/argv-second.log"
+  new_case second-instance
+  start_daemon GPU=0 IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1
+  if ! wait_for_count "$OUT" 'msg="clamp verified"' 1 60; then
+    fail "the first instance clamps" "no clamp within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  : > "$argv2"
+  run_cli GPU=0 IDLE_SECONDS=30 FAKE_ARGV_LOG="$argv2" --
+  assert_rc "a second instance on the same GPU exits 3" 3 "$RUN_RC"
+  assert_has "the duplicate is reported as an error" "$OUT" \
+    'level=error msg="gpu already managed" gpu=0'
+  assert_lacks "the duplicate never releases the live clamp" "$argv2" ' -rgc'
+  assert_lacks "the duplicate never clamps" "$argv2" ' -lgc '
+  assert_eq "the live instance keeps its clamp" 135 "$(cat "$STATE/clock.0" 2>/dev/null)"
+  # The live instance is still fully functional and owns its own release.
+  stop_daemon 0.3
+  assert_rc "the live instance still stops cleanly" 0 "$RUN_RC"
+  assert_has "the live instance releases its own clamp" "$OUT" \
+    'msg="unlocked" gpu=0 trigger=exit'
+  assert_file_gone "the live instance removes its own marker" "$DSTATE/gpu0.locked"
+}
+
+# flock is guarded: where it is missing the daemon warns and keeps working.
+case_flock_missing_still_starts() {
+  local shim="$WORK/shim-no-flock"
+  new_case no-flock
+  make_shim "$shim"
+  if [ -x "$shim/flock" ]; then
+    fail "the no-flock shim must not contain flock" "unexpected $shim/flock"
+    return
+  fi
+  start_daemon PATH="$shim" IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1
+  stop_daemon 1.2
+  assert_rc "the daemon starts without flock" 0 "$RUN_RC"
+  assert_has "the missing exclusion is a warning" "$OUT" 'level=warn msg="flock not found"'
+  assert_has "the missing exclusion does not stop the daemon" "$OUT" 'msg="started"'
+  assert_has "the clamp still works without flock" "$OUT" 'msg="clamp verified"'
+  assert_file_gone "the release still removes its marker without flock" \
+    "$DSTATE/gpu0.locked"
 }
 
 # --- run everything --------------------------------------------------------
@@ -856,6 +1079,16 @@ case_cli_dry_run_invalid
 case_cli_unknown_argument
 case_cli_positional_argument
 case_cli_no_args_starts
+case_state_dir_created
+case_state_fresh_run_untouched
+case_state_stale_marker_only_that_gpu
+case_unlock_cli_marked_only
+case_unlock_cli_failure_keeps_marker
+case_unlock_after_sigkill
+case_unlock_help
+case_cooldown_suppresses_then_allows
+case_second_instance_exits_3
+case_flock_missing_still_starts
 
 # --- no leaked stream children --------------------------------------------
 # The daemon kills its utilization-stream child on the way out (issue #7), and
