@@ -1,36 +1,354 @@
 #!/usr/bin/env bash
+# nvidia-idle-clock uninstaller.
+#
+# Every step is checked instead of being silenced with "|| true" (#14): a
+# failed stop aborts the removal (so a running daemon is never left without
+# its unit), a failed removal or clock release is reported and makes the whole
+# run fail, and success is only printed when the verification passed.
 set -euo pipefail
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "root 権限が必要です: sudo $0" >&2
+PROG="$(basename -- "$0")"
+
+DAEMON_BIN="/usr/local/sbin/nvidia-idle-clock"
+UNIT_TEMPLATE="/etc/systemd/system/nvidia-idle-clock@.service"
+LEGACY_UNIT="/etc/systemd/system/nvidia-idle-clock.service"
+LEGACY_UNIT_NAME="nvidia-idle-clock.service"
+# Template drop-in directory: systemd keeps "nvidia-idle-clock@.service.d"
+# for the template itself, plus one "*.service.d" per instance.
+UNIT_DIR="/etc/systemd/system"
+
+DRY_RUN=0
+KEEP_CLOCKS=0
+FAIL=0
+SYSTEMD_OK=1
+
+# --- output ---------------------------------------------------------------
+# Stable key=value records, so logs stay greppable (see issue #31).
+info()  { printf 'level=info %s\n' "$*"; }
+warn()  { printf 'level=warn %s\n' "$*" >&2; }
+error() { printf 'level=error %s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+usage: $PROG [OPTIONS]
+
+Stop and disable every nvidia-idle-clock instance, remove the installed
+daemon and unit files (including per-instance drop-in directories) and
+release the GPU clock locks with "nvidia-smi -rgc".
+
+options:
+  -h, --help        show this help and exit
+  -n, --dry-run     print every action without changing anything
+                    (does not need root)
+      --keep-clocks do not touch the GPU clock locks (the units are removed,
+                    the current clock limit stays in place until reboot)
+EOF
+}
+
+usage_error() {
+  error "msg=\"$1\" hint=\"run '$PROG --help'\""
+  printf 'usage: %s [OPTIONS]\n' "$PROG" >&2
+  exit 2
+}
+
+die() {
+  error "msg=\"$1\""
   exit 1
-fi
+}
 
-# 有効なインスタンス (テンプレート) をすべて停止・無効化
-for u in $(systemctl list-units --all --plain --no-legend 'nvidia-idle-clock@*.service' 2>/dev/null | awk '{print $1}'); do
-  systemctl disable --now "$u" 2>/dev/null || true
-done
+# --- helpers --------------------------------------------------------------
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -n|--dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --keep-clocks)
+        KEEP_CLOCKS=1
+        shift
+        ;;
+      --)
+        shift
+        [ "$#" -eq 0 ] || usage_error "unexpected argument: $1"
+        ;;
+      -*)
+        usage_error "unknown option: $1"
+        ;;
+      *)
+        usage_error "unexpected argument: $1"
+        ;;
+    esac
+  done
+}
 
-# 旧・非テンプレート版
-systemctl disable --now nvidia-idle-clock.service 2>/dev/null || true
+require_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  die "root privileges are required; run: sudo ./uninstall.sh"
+}
 
-rm -f /etc/systemd/system/nvidia-idle-clock@.service \
-      /etc/systemd/system/nvidia-idle-clock.service \
-      /usr/local/sbin/nvidia-idle-clock
+preflight() {
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found; nothing was removed"
 
-# GPU ごとの drop-in 設定
-for d in /etc/systemd/system/nvidia-idle-clock@*.service.d; do
-  [ -d "$d" ] || continue
-  echo "削除: $d"
-  rm -rf "$d"
-done
+  # "offline"/"unknown" means there is no systemd to talk to (container, WSL,
+  # chroot). Removing files is still useful there, but the unit steps cannot
+  # run; say so instead of pretending they succeeded.
+  local state
+  state="$(systemctl is-system-running 2>/dev/null || true)"
+  case "$state" in
+    running|degraded|starting|initializing|maintenance) ;;
+    *)
+      SYSTEMD_OK=0
+      warn 'msg="systemd is not running, unit steps are skipped"' "state=\"${state:-none}\"" 'note="remove the files only"'
+      ;;
+  esac
+}
 
-systemctl daemon-reload
-systemctl reset-failed 'nvidia-idle-clock@*' 2>/dev/null || true
+# --- steps ----------------------------------------------------------------
+stop_instances() {
+  local list unit
+  [ "$SYSTEMD_OK" -eq 1 ] || return 0
 
-# 残っているクロックロックを解除
-for g in $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null); do
-  nvidia-smi -i "$g" -rgc >/dev/null 2>&1 || true
-done
+  if ! list="$(systemctl list-units --all --plain --no-legend 'nvidia-idle-clock@*.service' 2>/dev/null)"; then
+    # Without the list we cannot know what is still running: stop here rather
+    # than deleting unit files behind a live daemon.
+    error "msg=\"could not list nvidia-idle-clock instances; files were left in place\""
+    exit 1
+  fi
 
-echo "アンインストール完了 (クロックロックは解除済み)"
+  local -a units=()
+  while IFS= read -r unit; do
+    unit="${unit%% *}"
+    [ -n "$unit" ] || continue
+    units+=("$unit")
+  done <<<"$list"
+
+  for unit in ${units[@]+"${units[@]}"}; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "msg=\"would disable\" unit=\"$unit\""
+      continue
+    fi
+    if systemctl disable --now "$unit"; then
+      info "msg=\"disabled\" unit=\"$unit\""
+    else
+      error "msg=\"could not stop and disable\" unit=\"$unit\" hint=\"systemctl disable --now $unit\""
+      FAIL=1
+    fi
+  done
+}
+
+stop_legacy_unit() {
+  local load_state
+  [ "$SYSTEMD_OK" -eq 1 ] || return 0
+  [ -e "$LEGACY_UNIT" ] || return 0
+
+  load_state="$(systemctl show -p LoadState --value "$LEGACY_UNIT_NAME" 2>/dev/null || true)"
+  if [ "$load_state" = "not-found" ]; then
+    info "msg=\"legacy unit is not loaded, skipping disable\" unit=\"$LEGACY_UNIT_NAME\""
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "msg=\"would disable legacy unit\" unit=\"$LEGACY_UNIT_NAME\""
+    return 0
+  fi
+  if systemctl disable --now "$LEGACY_UNIT_NAME"; then
+    info "msg=\"disabled legacy unit\" unit=\"$LEGACY_UNIT_NAME\""
+  else
+    error "msg=\"could not stop and disable legacy unit\" unit=\"$LEGACY_UNIT_NAME\""
+    FAIL=1
+  fi
+}
+
+# Remove a file or directory; failures are collected instead of aborting the
+# run, so the remaining cleanup still happens.
+remove_path() {
+  local path="$1" flag="${2:-}"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    info "msg=\"not present\" path=\"$path\""
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "msg=\"would remove\" path=\"$path\""
+    return 0
+  fi
+  if [ -n "$flag" ]; then
+    if rm -rf -- "$path"; then
+      info "msg=\"removed\" path=\"$path\""
+    else
+      error "msg=\"could not remove\" path=\"$path\""
+      FAIL=1
+    fi
+    return 0
+  fi
+  if rm -f -- "$path"; then
+    info "msg=\"removed\" path=\"$path\""
+  else
+    error "msg=\"could not remove\" path=\"$path\""
+    FAIL=1
+  fi
+}
+
+remove_files() {
+  local dir
+  remove_path "$UNIT_TEMPLATE"
+  remove_path "$LEGACY_UNIT"
+  remove_path "$DAEMON_BIN"
+
+  # Drop-ins are the documented place for per-GPU settings, and they survive
+  # a reinstall; remove the template directory and every instance directory.
+  for dir in "$UNIT_DIR"/nvidia-idle-clock@*.service.d "$UNIT_DIR/nvidia-idle-clock@.service.d"; do
+    [ -d "$dir" ] || continue
+    remove_path "$dir" recursive
+  done
+}
+
+reload_systemd() {
+  [ "$SYSTEMD_OK" -eq 1 ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "msg=\"would run systemctl daemon-reload\""
+    return 0
+  fi
+  if systemctl daemon-reload; then
+    info "msg=\"systemd reloaded\""
+  else
+    error "msg=\"systemctl daemon-reload failed\""
+    FAIL=1
+  fi
+  # reset-failed is cosmetic: a unit that is gone cannot be started again.
+  systemctl reset-failed 'nvidia-idle-clock@*' >/dev/null 2>&1 \
+    || warn "msg=\"systemctl reset-failed failed (harmless)\""
+}
+
+# Release the clock lock with -rgc for every GPU and verify the exit code;
+# the audit (#14) showed that a silent failure here leaves a GPU clamped at
+# 135MHz until the next reboot.
+release_clocks() {
+  local gpus gpu
+  local -a failed=() released=()
+
+  if [ "$KEEP_CLOCKS" -eq 1 ]; then
+    info "msg=\"clock locks kept (--keep-clocks)\" hint=\"run: sudo nvidia-smi -i <N> -rgc\""
+    return 0
+  fi
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    info "msg=\"nvidia-smi not found, no clock lock to release\""
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null || true)"
+    gpus="${gpus//[[:space:]]/ }"
+    if [ -z "${gpus// /}" ]; then
+      info "msg=\"would query the GPUs and release every clock lock\""
+    else
+      for gpu in $gpus; do
+        info 'msg="would release clock lock"' "gpu=\"$gpu\""
+      done
+    fi
+    return 0
+  fi
+
+  if ! gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null)"; then
+    error "msg=\"could not enumerate GPUs with nvidia-smi\" hint=\"release the locks by hand: sudo nvidia-smi -i <N> -rgc\""
+    FAIL=1
+    return 0
+  fi
+  gpus="${gpus//[[:space:]]/ }"
+  if [ -z "${gpus// /}" ]; then
+    error "msg=\"nvidia-smi reported no GPU; cannot verify that the clock locks were released\" hint=\"sudo nvidia-smi -i <N> -rgc\""
+    FAIL=1
+    return 0
+  fi
+
+  for gpu in $gpus; do
+    if nvidia-smi -i "$gpu" -rgc >/dev/null 2>&1; then
+      info 'msg="clock lock released"' "gpu=\"$gpu\""
+      released+=("$gpu")
+    else
+      error 'msg="could not release the clock lock"' "gpu=\"$gpu\"" "hint=\"sudo nvidia-smi -i $gpu -rgc\""
+      failed+=("$gpu")
+      FAIL=1
+    fi
+  done
+
+  if [ "${#failed[@]}" -gt 0 ]; then
+    warn "msg=\"clocks still locked\" gpus=\"${failed[*]}\""
+  elif [ "${#released[@]}" -eq 0 ]; then
+    error "msg=\"no GPU was released\""
+    FAIL=1
+  fi
+}
+
+# Verify the end state instead of trusting the exit codes alone.
+verify_removed() {
+  local path missing=0
+  for path in "$UNIT_TEMPLATE" "$LEGACY_UNIT" "$DAEMON_BIN"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      error "msg=\"file still present after removal\" path=\"$path\""
+      FAIL=1
+      missing=1
+    fi
+  done
+  for path in "$UNIT_DIR"/nvidia-idle-clock@*.service.d "$UNIT_DIR/nvidia-idle-clock@.service.d"; do
+    if [ -d "$path" ]; then
+      error "msg=\"drop-in directory still present after removal\" path=\"$path\""
+      FAIL=1
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || return 0
+  info "msg=\"verified removal\" paths=\"$UNIT_TEMPLATE $LEGACY_UNIT $DAEMON_BIN\""
+}
+
+main() {
+  local clock_note
+  parse_args "$@"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    require_root
+  fi
+  preflight
+
+  stop_instances
+  stop_legacy_unit
+  # Removing a unit file while its daemon is still running would leave the
+  # clamp active with no way to stop it: abort before deleting anything.
+  if [ "$FAIL" -ne 0 ]; then
+    error "msg=\"at least one unit could not be stopped; files were left in place\""
+    exit 1
+  fi
+  remove_files
+  reload_systemd
+  release_clocks
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "msg=\"dry-run complete\" dry_run=1 keep_clocks=$KEEP_CLOCKS"
+    printf 'dry-run: nothing was changed\n'
+    exit 0
+  fi
+
+  verify_removed
+
+  if [ "$FAIL" -ne 0 ]; then
+    error "msg=\"uninstall incomplete\" hint=\"fix the errors above and run the uninstaller again\""
+    exit 1
+  fi
+
+  if [ "$KEEP_CLOCKS" -eq 1 ]; then
+    clock_note="clock locks kept by --keep-clocks"
+  else
+    clock_note="clock locks released"
+  fi
+  [ "$SYSTEMD_OK" -eq 1 ] \
+    || warn 'msg="systemd was not running: unit state was not cleaned up"'
+  info 'msg="uninstall complete"' "clocks=\"$clock_note\""
+  printf 'uninstall complete: units removed, %s\n' "$clock_note"
+}
+
+main "$@"
