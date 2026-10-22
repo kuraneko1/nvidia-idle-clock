@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-22
+
+Follow-up to the v0.2.1 release audit. The daemon's control loop is unchanged; these are
+installer, unit and periphery fixes.
+
+### Fixed
+
+- **installer:** a failed install now restores a pre-existing legacy
+  `nvidia-idle-clock.service` (enabled and, if it was running, active) on rollback, and no longer
+  claims "the previous state was restored" when a unit could not be restored.
+- **installer:** a stale `${STATE_DIR:-/run/nvidia-idle-clock}/keep-clocks` marker left by
+  `uninstall.sh --keep-clocks` is cleared by the next install, so reinstalling can no longer produce
+  a daemon that never releases clocks and a `--unlock` that silently does nothing.
+- **daemon:** no empty `nvidia-idle-clock.XXXXXX` temp file is left behind on exit 1 (runtime error)
+  or exit 3 (GPU already managed); the file is allocated after the exclusion check and the trap.
+- **systemd:** exit 2 (invalid configuration or arguments) is no longer retried — a permanent
+  mistake fails immediately instead of burning the 30-restart budget (`RestartPreventExitStatus=2 3`).
+- **systemd:** the driver-node check runs through `/bin/sh -c` instead of `/usr/bin/test`, so it
+  works on hosts without coreutils at `/usr/bin` (e.g. NixOS).
+
+### Changed
+
+- Documented two deliberate trade-offs in the source headers: a start ignores `keep-clocks` (the
+  keep covers the stop paths only), and the recovery marker is written before `-lgc`, so a later
+  `--unlock` can reset a lock that another tool set in between.
+
 ## [0.2.1] - 2026-10-22
 
 Follow-up fixes from an independent review of 0.2.0. No behaviour change for a
