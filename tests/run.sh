@@ -457,6 +457,95 @@ case_log_format() {
   assert_eq "the daemon source is ASCII only (English)" 0 "$bad"
 }
 
+# --- #25: command-line handling -------------------------------------------
+# Environment overrides first, then `--`, then the daemon arguments. Reuses the
+# same fake nvidia-smi state and log files as run_daemon.
+run_cli() { # [NAME=VALUE ...] -- [ARG ...]
+  local rc=0 under_test="${SCRIPT_UNDER_TEST:-$SCRIPT}"
+  local -a envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  if [ "$#" -gt 0 ]; then shift; fi
+  env NVSMI="$FAKE" FAKE_STATE="$STATE" "${envs[@]+"${envs[@]}"}" \
+    "$TIMEOUT_BIN" 10 "$BASH_BIN" "$under_test" "$@" >>"$OUT" 2>>"$ERR" || rc=$?
+  RUN_RC=$rc
+}
+
+case_cli_help() {
+  new_case cli-help
+  # The invalid environment proves the arguments are parsed before validation.
+  run_cli UTIL_THRESHOLD=10% -- --help
+  assert_rc "--help exits 0 even with an invalid environment" 0 "$RUN_RC"
+  assert_has "--help prints a usage line" "$OUT" 'usage: nvidia-idle-clock'
+  assert_has "--help documents the environment variables" "$OUT" 'environment variables'
+  assert_has "--help documents NVSMI" "$OUT" 'NVSMI'
+  assert_has "--help documents GPU" "$OUT" 'GPU'
+  assert_has "--help documents the numeric knobs" "$OUT" 'IDLE_SECONDS'
+  assert_has "--help documents the exit codes" "$OUT" 'exit status:'
+  assert_has "--help shows an example" "$OUT" 'nvidia-idle-clock --version'
+  assert_no_gpu_calls "--help never runs nvidia-smi"
+}
+
+case_cli_version() {
+  local version
+  new_case cli-version
+  version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT")
+  run_cli -- --version
+  assert_rc "--version exits 0" 0 "$RUN_RC"
+  assert_eq "--version prints the VERSION constant" "nvidia-idle-clock $version" "$(cat "$OUT")"
+  assert_no_gpu_calls "--version never runs nvidia-smi"
+}
+
+case_cli_dry_run() {
+  new_case cli-dry-run
+  run_cli -- --dry-run
+  assert_rc "--dry-run exits 0" 0 "$RUN_RC"
+  assert_has "--dry-run prints the resolved plan" "$OUT" \
+    'msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200'
+  assert_has "--dry-run names the resolved nvidia-smi" "$OUT" "nvidia_smi=$FAKE"
+  assert_has "--dry-run says what would be clamped" "$OUT" 'msg="would clamp when idle"'
+  assert_has "--dry-run says what would be unlocked" "$OUT" 'msg="would unlock on use or exit"'
+  assert_count "--dry-run never locks clocks" "$ARGV" ' -lgc ' 0
+  assert_count "--dry-run never unlocks clocks" "$ARGV" ' -rgc' 0
+  assert_lacks "--dry-run does not claim a clamp happened" "$OUT" 'msg="clamp verified"'
+  assert_lacks "--dry-run does not claim an unlock happened" "$OUT" 'msg="unlocked"'
+  assert_lacks "--dry-run does not enter the loop" "$OUT" 'msg="started"'
+}
+
+case_cli_dry_run_invalid() {
+  new_case cli-dry-run-invalid
+  run_cli UTIL_THRESHOLD=10% -- --dry-run
+  assert_rc "--dry-run with an invalid config exits 2" 2 "$RUN_RC"
+  assert_has "--dry-run validates the config first" "$OUT" 'msg="invalid config" var=UTIL_THRESHOLD'
+  assert_no_gpu_calls "--dry-run with an invalid config never runs nvidia-smi"
+}
+
+case_cli_unknown_argument() {
+  new_case cli-unknown
+  run_cli -- --definitely-not-an-option
+  assert_rc "an unknown option exits 2" 2 "$RUN_RC"
+  assert_has "the unknown option is logged" "$OUT" \
+    'level=error msg="unknown argument" arg=--definitely-not-an-option'
+  assert_has "the usage line is printed on stderr" "$ERR" 'usage:'
+  assert_no_gpu_calls "an unknown option never runs nvidia-smi"
+}
+
+case_cli_positional_argument() {
+  new_case cli-positional
+  run_cli -- start
+  assert_rc "a positional argument exits 2" 2 "$RUN_RC"
+  assert_has "the positional argument is logged" "$OUT" 'msg="unknown argument" arg=start'
+  assert_no_gpu_calls "a positional argument never runs nvidia-smi"
+}
+
+case_cli_no_args_starts() {
+  new_case cli-no-args
+  start_daemon IDLE_SECONDS=30
+  stop_daemon 0.7
+  assert_rc "no arguments starts the daemon" 0 "$RUN_RC"
+  assert_has "no arguments reaches the start line" "$OUT" 'msg="started"'
+  assert_ge "no arguments still unlocks clocks at startup" 1 "$(grep_count "$ARGV" ' -rgc')"
+}
+
 # --- run everything --------------------------------------------------------
 case_config_util_threshold
 case_config_gpu_glob
@@ -484,6 +573,13 @@ case_gpu_index_selected
 case_gpu_uuid_selected
 case_gpu_unknown
 case_log_format
+case_cli_help
+case_cli_version
+case_cli_dry_run
+case_cli_dry_run_invalid
+case_cli_unknown_argument
+case_cli_positional_argument
+case_cli_no_args_starts
 
 if [ "$FAIL" -eq 0 ]; then
   printf '\nsummary: %d checks passed, 0 failed\n' "$PASS"
