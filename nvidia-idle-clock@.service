@@ -59,11 +59,37 @@ ExecStart=/usr/local/sbin/nvidia-idle-clock
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=20s
+# A GPU that another instance already manages is a configuration mistake, not a
+# transient fault: the daemon exits 3 and nothing was touched. Without this,
+# Restart=on-failure would retry it 30 times and only then report the failure.
+RestartPreventExitStatus=3
+
+# The daemon releases its own clamp from the EXIT trap, which a SIGKILL, an OOM
+# kill or a stop that reached TimeoutStopSec can never run. This runs after
+# *every* stop - including SIGKILL - and releases exactly the GPUs that carry a
+# state marker; a GPU this unit never clamped is left alone (#9, #20). The
+# leading "-" keeps a failed release from changing the unit result: the daemon
+# itself already reports failure where it can.
+ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock
 
 # Sandboxing (#10). The unit runs bash + nvidia-smi and logs to the journal, so
 # it needs no writable file system, no /home, no network and no kernel
 # interfaces. Device access is untouched: PrivateDevices= and DevicePolicy= are
 # deliberately not set, /dev/nvidia* stays reachable exactly as before.
+#
+# The one writable path is the state directory (STATE_DIR, default
+# /run/nvidia-idle-clock). ProtectSystem=strict makes /run read-only as well, so
+# the daemon could not create its markers without an allowance. A narrower
+# ReadWritePaths=/run/nvidia-idle-clock cannot be used: while that directory
+# does not exist yet (any fresh boot) systemd fails the whole unit with
+# "Failed to set up mount namespacing: No such file or directory"
+# (226/NAMESPACE, verified with systemd 255), and the daemon cannot create it
+# while /run is read-only. RuntimeDirectory= is deliberately not used either:
+# systemd deletes it when the unit stops, i.e. exactly when a marker has to
+# survive for --unlock. The system parts of /run stay read-only; AF_UNIX sockets
+# (journald, logind) keep working, as those are unaffected by these options.
+ReadWritePaths=/run
+ReadOnlyPaths=/run/systemd /run/udev /run/log
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
