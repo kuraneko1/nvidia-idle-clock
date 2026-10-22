@@ -8,20 +8,23 @@ and releases it when load appears. It runs **one independent instance per GPU**,
 so each card can have its own settings.
 Dependencies are bash and `nvidia-smi` — no NVAPI, no CUDA toolkit, no build step.
 
-| State | No clamp | Clamped @135MHz |
-|---|---|---|
-| V100-PCIE-32GB / 3.6GiB in VRAM | 36.3W (peak 44.7W) | **24.9W** |
-| PG500-216 / 8GiB in VRAM | 40.9W | **28.4W** |
-| VRAM empty | 24.6W / 28.1W | no change |
+| State | No clamp | Clamped @135MHz | Saving |
+|---|---|---|---|
+| V100-PCIE-32GB / ~31GiB in VRAM | 37.85W | **25.22W** | **−12.63W** |
+| PG500-216 / ~31GiB in VRAM | 42.43W | **28.85W** | **−13.58W** |
+| VRAM empty | 25.50W / 29.20W | 25.45W / 28.97W | −0.05W / −0.23W (noise) |
 
-A repeat run under the same conditions measured 25.1W / 28.5W (V100 / PG500-216).
-See [Measurements](#measurements) for the rig and raw numbers.
+4 × 600s samples (n≈1060–1067 per GPU, stdev 0.05–0.33W, `utilization.gpu` 0.0 in every
+sample). The older 3.6GiB / 8GiB-held runs measured 36.3W → 24.9W / 40.9W → 28.4W, and a
+repeat run 25.1W / 28.5W, consistent with the values above. See Measurements for the
+conditions and raw numbers.
 
 > **It only helps while VRAM is held.**
 > With VRAM empty the driver comes down to 135MHz by itself, so the clamp makes no difference
-> (measured delta: 0.0W). Conversely, **while VRAM is held the driver never comes down** —
-> PG500-216 + 8GiB stayed at 1260MHz / 40–41W for a full **180 seconds**.
-> That is the only case this tool targets.
+> (measured delta: 0.05W / 0.23W, i.e. noise). Conversely, **while VRAM is held the driver never
+> comes down** — PG500-216 (GPU1) + 8GiB stayed at 1260MHz / 40–41W for a full **180 seconds**.
+> That is the only case this tool targets. The default idle step differs per board
+> (measured: GPU0 1230MHz, GPU1 1260MHz).
 > Compute and memory bandwidth are **restored to within 0.01%** after the clamp is released
 > (measured on PG500-216 with 8GiB held).
 
@@ -39,12 +42,12 @@ See [Measurements](#measurements) for the rig and raw numbers.
 
 ## How it differs from stock
 
-![Measured timeline: 27.8W while clamped at 135MHz, back to 1260MHz / 39.5W within 0.5s of load being detected, then re-clamped after 30.2s of no load](img/timeline.png)
+![Measured timeline (PG500-216 / 8GiB held, older run): 27.8W while clamped at 135MHz, back to 1260MHz / 39.5W within 0.5s of load being detected, then re-clamped after 30.2s of no load](img/timeline.png)
 
 | | Stock (driver-managed) | With this daemon |
 |---|---|---|
-| Clock while VRAM held and idle | stays at 1260–1380MHz, never drops | **135MHz** (after 30s idle) |
-| Power in that state | 36–41W | **24.9–28.4W** |
+| Clock while VRAM held and idle | stays at 1230–1380MHz (GPU0 1230 / GPU1 1260MHz), never drops | **135MHz** (after 30s idle) |
+| Power in that state | 37.9–42.4W | **25.2–28.9W** |
 | When load arrives | runs as-is | detected on the next sample, then `nvidia-smi -rgc` spawn and driver ramp: ≤0.5s in the timeline figure, 0.18–0.22s to reach 1300MHz measured in-kernel |
 | 30s after load stops | still at the high clock | back to 135MHz |
 | When VRAM is empty | driver drops to 135MHz by itself | **does nothing** (same) |
@@ -58,8 +61,8 @@ The only externally visible difference is `clocks.current.graphics` reading 135M
 ```
 $ nvidia-smi --query-gpu=index,pstate,clocks.gr,clocks.max.gr,power.draw --format=csv
 index, pstate, clocks.current.graphics [MHz], clocks.max.graphics [MHz], power.draw [W]
-0, P0, 135 MHz, 1380 MHz, 24.95 W
-1, P0, 135 MHz, 1380 MHz, 27.87 W
+0, P0, 135 MHz, 1380 MHz, 25.22 W
+1, P0, 135 MHz, 1380 MHz, 28.85 W
 ```
 
 (One sample at one point in time, clamped with `IDLE_CAP=135`.)
@@ -115,16 +118,17 @@ workload spent 185ms of its 500ms (37%) at 126MHz.
 
 | GPU | Status |
 |---|---|
-| Tesla V100-PCIE-32GB (sm70) | **Verified** — latency measurements and idle power (36.3W → 24.9W) |
-| Tesla PG500-216 (GV100 32GB, sm70) | **Verified** — clamp ladder, performance measurements and idle power (40.9W → 28.4W) |
+| Tesla V100-PCIE-32GB (sm70) | **Verified** — latency measurements and idle power (37.85W → 25.22W, ~31GiB held in VRAM) |
+| Tesla PG500-216 (GV100 32GB, sm70) | **Verified** — clamp ladder, performance measurements and idle power (42.43W → 28.85W, ~31GiB held in VRAM) |
 | Tesla V100-SXM2 / V100-PCIE-16GB | Unverified (same sm70 with the same 135MHz floor, but not tested on hardware) |
 | Other sm70 parts (Quadro GV100 etc.) | Unverified |
 | Newer than Volta (Turing / Ampere / Ada / Hopper) | **Unsupported** — `-lgc` exists, but this project has not been tested on them (the saving is unverified too) |
 | Older than Volta (Pascal etc.) | **Unsupported** — `nvidia-smi` has no `-lgc` |
 
-The daemon validates the requested clock range at runtime; if the device does not accept it, it
-warns and skips that GPU instead of pretending to have clamped. The default `IDLE_CAP` / `MIN_CLK`
-of 135MHz is the V100 floor — set it to the real floor on other cards.
+The daemon validates the requested clock range at startup and refuses to start if `IDLE_CAP`
+exceeds that GPU's `clocks.max.gr`. If `-lgc` is rejected at runtime it warns with the driver's
+error and retries with backoff instead of pretending to have clamped. The default `IDLE_CAP` /
+`MIN_CLK` of 135MHz is the V100 floor — set it to the real floor on other cards.
 
 ## Install
 
@@ -134,7 +138,7 @@ of 135MHz is the V100 floor — set it to the real floor on other cards.
 ```bash
 git clone https://github.com/kuraneko1/nvidia-idle-clock.git
 cd nvidia-idle-clock
-sudo ./install.sh          # one instance per detected GPU
+sudo ./install.sh          # 1 instance per detected GPU
 sudo ./install.sh 0 1      # pick GPUs explicitly
 ```
 
@@ -147,6 +151,82 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nvidia-idle-clock@0.service   # GPU 0
 sudo systemctl enable --now nvidia-idle-clock@1.service   # GPU 1
 ```
+
+### Installer options
+
+`install.sh` parses its own options instead of treating argv as GPU names.
+
+| Option | Effect |
+|---|---|
+| `-h`, `--help` | print usage and exit |
+| `-V`, `--version` | print the installer version and the daemon sha256, exit |
+| `-n`, `--dry-run` | print every action without writing anything (does not need root) |
+| `--force` | skip the source-tree trust check only |
+| `--gpus LIST` | GPU list, comma or space separated (may be repeated) |
+| `--` | treat every following argument as a GPU |
+| `[GPU ...]` | `nvidia-smi` index, GPU UUID or MIG identifier |
+
+`uninstall.sh`:
+
+| Option | Effect |
+|---|---|
+| `-h`, `--help` | print usage and exit |
+| `-n`, `--dry-run` | print every action without changing anything |
+| `--keep-clocks` | remove the units and files but leave the clock locks in place |
+
+Both validate before writing. The `install.sh` preflight checks the required commands
+(`nvidia-smi`, `systemctl`, `install`, `sha256sum`, `stat`, `cp`, `cmp`, `date`), that systemd is
+running, and that the payload files exist; an argument error exits 2 and an environment error
+exits 1, in both cases **before anything is written**. Once writing has started, a failure runs
+the rollback: newly created files are removed and replaced files are restored from a timestamped
+backup (`<path>.bak.<YYYYMMDDTHHMMSS>`).
+
+- Replacing an existing file always leaves a `.bak.<timestamp>` copy (a second install within the
+  same second adds the PID).
+- Instances that were already active are switched to the new code with `systemctl try-restart`
+  only when the payload changed. A failed restart is reported with exit 1 but the installed units
+  are kept.
+- A checkout used for a root install must be owned by root or by the user running sudo, must not
+  be world writable, and must not be group writable through a shared group; otherwise it is
+  refused without `--force` (nothing is written).
+- `uninstall.sh` leaves the files in place when a unit cannot be stopped (a running daemon must
+  not be left without its unit). After removal it verifies that the files are gone and checks the
+  `-rgc` result.
+
+## Daemon command line
+
+```
+usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]
+```
+
+| Option | Effect |
+|---|---|
+| `-h`, `--help` | print usage and exit |
+| `-V`, `--version` | print `nvidia-idle-clock 0.2.0` and exit |
+| `-n`, `--dry-run` | validate the configuration, print the resolved plan and exit; never calls `-lgc` / `-rgc` |
+| none | run the daemon in the foreground (systemd `Type=simple`) |
+
+`--help` / `--version` are handled before configuration validation; `--dry-run` runs after
+validation and GPU resolution but before the first `-lgc` / `-rgc`. Unknown options and positional
+arguments print `level=error msg="unknown argument"` plus the usage line on stderr and exit **2**.
+
+```
+$ nvidia-idle-clock --dry-run
+level=info msg="dry run" gpu=0 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 nvidia_smi=/usr/bin/nvidia-smi
+level=info msg="would clamp when idle" gpu=0 after_idle_s=30 util_threshold_pct=0 min_mhz=135 cap_mhz=135 skip_if_low=1
+level=info msg="would unlock on use or exit" gpu=0 trigger=util,exit
+```
+
+Exit status:
+
+| Code | Meaning |
+|---|---|
+| `0` | clean stop (SIGTERM / SIGINT), or `--help` / `--version` / `--dry-run` succeeded |
+| `1` | runtime failure (no usable GPU, `nvidia-smi` missing, stalled stream, unlock failed, ...) |
+| `2` | invalid configuration or unknown argument |
+
+Configuration is validated before any GPU is touched: an invalid value logs
+`level=error msg="invalid config"` and exits 2, a missing `nvidia-smi` exits 1.
 
 ## Per-GPU assignment
 
@@ -197,17 +277,47 @@ for g in $(nvidia-smi --query-gpu=index --format=csv,noheader); do sudo nvidia-s
 
 ## Measurements
 
-Rig: Tesla V100-PCIE-32GB + Tesla PG500-216 (GV100 32GB x2) / driver 580.178.04.
-"VRAM held" means a CUDA context holding 3.6GiB / 8GiB. 20s averages unless stated otherwise.
+Rig: Tesla V100-PCIE-32GB + Tesla PG500-216 (GV100 32GB x2) / driver 580.178.04 / no NVLink.
+20s averages unless stated otherwise. Power is the GPU board sensor (`power.draw`), so PSU
+losses, CPU and disks are excluded. The older "VRAM held" runs used a CUDA context holding
+3.6GiB / 8GiB. The new A/B measurement had an inference server holding ~31GiB/GPU (the GPUs
+themselves were idle).
 
 Over a 26h production run the clamp was held 77.6% / 71.0% of the time (GPU0 / GPU1),
 with 141 clamp events in 24h.
 
 ### Idle power — effectiveness depends on VRAM state
 
-![Bar chart of idle power: V100-PCIE-32GB drops from 36.3W to 24.9W with 3.6GiB held, PG500-216 drops from 40.9W to 28.4W with 8GiB held, and with VRAM empty both cards stay at 24.6/28.1W](img/idle-power.png)
+![Bar chart of idle power (older 3.6GiB / 8GiB-held run): V100-PCIE-32GB drops from 36.3W to 24.9W, PG500-216 from 40.9W to 28.4W, and with VRAM empty both cards stay at 24.6/28.1W](img/idle-power.png)
 
-<!--POWER_MEASUREMENT_TABLE-->
+**Method.** 4 × 600s samples, `nvidia-smi --loop-ms=500`, first 60s dropped. n≈1060–1067
+samples per GPU, stdev 0.05–0.33W. `utilization.gpu` was 0.0 (mean and maximum) in every
+sample — the GPUs were idle, the LLM server only held VRAM. A1/A2 and B1/B2 are adjacent pairs
+on the same board, so thermal drift cancels.
+
+| State | GPU0 (V100-PCIE-32GB) | GPU1 (PG500-216) | Combined |
+|---|---|---|---|
+| VRAM held (~31GiB/GPU), clamped 135MHz (A1) | 25.22W | 28.85W | 27.04W |
+| VRAM held, no clamp (driver 1230/1260MHz) (A2) | 37.85W | 42.43W | 40.14W |
+| **Saving while VRAM is held** | **12.63W** | **13.58W** | **26.21W** |
+| VRAM empty, no clamp (B1) | 25.50W | 29.20W | 27.35W |
+| VRAM empty, clamped (B2) | 25.45W | 28.97W | 27.21W |
+| **Saving while VRAM is empty** | **0.05W** | **0.23W** | **0.28W ≈ 0 (noise)** |
+
+- **Only the VRAM-held case saves anything.** With VRAM empty the driver drops to 135MHz by
+  itself, so the clamp makes no difference (0.05W / 0.23W is noise). While VRAM is held the
+  driver never comes down, which is the only case this tool targets.
+- The measured default idle step differs per board (GPU0 1230MHz, GPU1 1260MHz). "1260MHz" is
+  the GPU1 (PG500-216) value, not something that applies to both cards.
+- Held for a full year, the combined 26.21W saving is **229.6kWh/year**. At idle duties of
+  25/50/75/100% that is **57.4 / 114.8 / 172.2 / 229.6kWh/year**.
+- At **37 JPY/kWh** — the Chubu Electric Power 従量電灯B marginal rate for the 300kWh+ tier
+  including the fuel-cost adjustment and the renewable surcharge, effective 2026-11-01 — that
+  is about **8,494 JPY/year**. At the 32.89 JPY/kWh rate through 2026-10-31 it is
+  **7,551 JPY/year**. This is a Shizuoka example and the fuel-cost adjustment changes monthly.
+- Conditions: driver 580.178.04, two V100-class boards, no NVLink, GPU board power only
+  (PSU losses, CPU and disks are excluded). The figures are the delta of adjacent same-board
+  pairs.
 
 ### Clock ceiling (PG500-216 / 8GiB in VRAM, 20s each)
 
@@ -246,10 +356,12 @@ print one.
 ```
 $ journalctl -u nvidia-idle-clock@0 -o cat
 level=info msg="started" gpu=0,1 min_mhz=135 cap_mhz=135 idle_s=30 sample_ms=200 util_threshold_pct=0 reassert_s=30 skip_if_low=1 nvidia_smi=/usr/bin/nvidia-smi
-level=info msg="clamp verified" gpu=0 trigger=idle was_mhz=1260 observed_mhz=135 min_mhz=135 cap_mhz=135
+level=info msg="clamp verified" gpu=0 trigger=idle was_mhz=1230 observed_mhz=135 min_mhz=135 cap_mhz=135
 level=info msg="clamp verified" gpu=1 trigger=idle was_mhz=1260 observed_mhz=135 min_mhz=135 cap_mhz=135
 level=info msg="unlocked" gpu=0 trigger=util util_pct=42
 level=info msg="stream lost" retry_s=2 stderr=""
+level=info msg="unlocked" gpu=0 trigger=exit
+level=info msg="unlocked" gpu=1 trigger=exit
 level=info msg="exit" gpu=0,1 rc=0
 ```
 
@@ -259,6 +371,8 @@ level=info msg="exit" gpu=0,1 rc=0
   `journalctl -u nvidia-idle-clock@0 -g 'level=(warn|error)'`.
 - A clean SIGTERM stop ends with `msg="exit" rc=0`; if the release failed, `msg="unlock failed"`
   is followed by `msg="exit" rc=1`.
+- `was_mhz` is 1230 for GPU0 but 1260 for GPU1 because the default idle step differs per board.
+  Do not assume a single 1260MHz value.
 
 ## Configuration
 
@@ -286,18 +400,26 @@ Both happen before the daemon touches any GPU.
 - `IDLE_SECONDS` idle → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
 - Utilization > `UTIL_THRESHOLD` → release with `-rgc`
 - With `SKIP_IF_LOW=1`, already-low GPUs are left alone (nothing to do when VRAM is empty)
-- Reconnects 2s after the utilization stream drops
+- If the utilization stream delivers nothing for `max(5s, 5×SAMPLE_MS)`, the `nvidia-smi` child is
+  stopped and the daemon exits 1 (`msg="utilization stream stale"`); systemd restarts it through
+  `Restart=on-failure`
+- When the stream ends, reconnect with exponential backoff (2→30s) and report the first stderr
+  line in `msg="stream lost"`; 5 failed reconnects inside 60s log
+  `msg="utilization stream unavailable"` and exit 1
+- Non-numeric utilization (`[N/A]`) is treated as unavailable: a held clamp is released (safe
+  side), the idle clock is reset, and the warning is logged once per streak
 - Also runs `-rgc` at startup (this is not a "release only what I locked" implementation, so do not
   run it next to another tool that manages clocks)
 - Releases with `-rgc` on stop/restart. SIGKILL, OOM and a `TimeoutStopSec` overrun cannot run the
-  shell trap, so those paths cannot release. **The unit is being hardened so the supervisor releases
-  the lock as well** (ExecStopPost)
+  shell trap, so those paths cannot release (the unit has no `ExecStopPost`). The next start does
+  run `-rgc` on every target GPU, which resets the clocks to the driver default
 
 ## Notes
 
 - The clamp is **device-wide**. Only root can set or clear it. On shared GPUs, read "Shared GPUs"
   first.
-- Only effective while VRAM is held. On a GPU with empty VRAM it does nothing.
+- Only effective while VRAM is held. On a GPU with empty VRAM it does nothing (the driver drops
+  to 135MHz by itself).
 - While clamped, compute drops to 0.089x and bandwidth to 0.12–0.19x. Release takes the next sample
   period + the `-rgc` spawn + the driver ramp: 0.2–0.5s at the defaults, proportional to `SAMPLE_MS`.
 - A GPU that is continuously inferring never reaches the idle state, so it is never clamped.
@@ -307,9 +429,10 @@ Both happen before the daemon touches any GPU.
   [nvidia-pstated](https://github.com/sasha0552/nvidia-pstated). Their READMEs carry no power
   figures and we have not measured a P40, so this README quotes no numbers.
 - `-rgc` only restores the driver's default policy; it does not force a low clock. With VRAM held
-  the clock is back at the driver-managed value within seconds (measured: 135MHz / 28.51W → 3s later
-  1260MHz / 38.97W; 10s average 28.51W → 40.31W, **+11.8W / +29.3%**), and the saving is lost until
-  the next re-assert (30s by default). It is a no-op only when there is no lock or VRAM is empty.
+  the clock is back at the driver-managed value within seconds (measured on PG500-216 / 8GiB held,
+  1260MHz default: 135MHz / 28.51W → 3s later 1260MHz / 38.97W; 10s average 28.51W → 40.31W,
+  **+11.8W / +29.3%**), and the saving is lost until the next re-assert (30s by default). It is a
+  no-op only when there is no lock or VRAM is empty.
 
 ## Shared GPUs
 
