@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-22
+
+Follow-up fixes from an independent review of 0.2.0. No behaviour change for a
+correctly configured host.
+
+### Fixed
+
+- **daemon:** clamp recovery intent is recorded before `-lgc`, and an
+  unverifiable read-back keeps the GPU as a release target (#44); a failed
+  startup release of a stale marker is retried when the GPU becomes busy
+  instead of being forgotten (#45).
+- **installer:** rollback no longer stops/disables instances that were running
+  before the run (#46).
+- **systemd:** a missing `/dev/nvidiactl` at boot is a retried `ExecStartPre=`
+  failure instead of a silent skip (#47).
+- **installer:** `--keep-clocks` now really keeps the clamp through the stop
+  path; the daemon honours `$STATE_DIR/keep-clocks` (#48).
+
+### Changed
+
+- **systemd:** the boot check moved from `ConditionPathExists=` to
+  `ExecStartPre=`.
+- **installer:** `--keep-clocks` writes a marker before stopping.
+
+### Docs
+
+- **docs:** reference updated for the above.
+
 ## [0.2.0] - 2026-10-22
 
 First tagged release. Entries are grouped by area: **daemon**
@@ -172,4 +200,5 @@ First tagged release. Entries are grouped by area: **daemon**
   ships (`.github/`, `tests/`, `docs/`, `SECURITY.md`, `CONTRIBUTING.md`,
   `CHANGELOG.md`, `.editorconfig`) and documents how to add a new file (#26).
 
+[0.2.1]: https://github.com/kuraneko1/nvidia-idle-clock/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kuraneko1/nvidia-idle-clock/releases/tag/v0.2.0
