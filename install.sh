@@ -22,12 +22,19 @@ DAEMON_DST="/usr/local/sbin/nvidia-idle-clock"
 UNIT_DST="/etc/systemd/system/nvidia-idle-clock@.service"
 LEGACY_UNIT="/etc/systemd/system/nvidia-idle-clock.service"
 LEGACY_UNIT_NAME="nvidia-idle-clock.service"
+# Shared with the daemon and uninstall.sh. Only the keep-clocks marker inside
+# it is ever touched here.
+STATE_DIR="${STATE_DIR:-/run/nvidia-idle-clock}"
+KEEP_CLOCKS_MARKER="$STATE_DIR/keep-clocks"
 
 DRY_RUN=0
 FORCE=0
 PAYLOAD_CHANGED=0
 RESTART_FAILED=0
 SYSTEMD_TOUCHED=0
+PRE_LEGACY_SNAPSHOT=0
+PRE_LEGACY_ENABLED=0
+PRE_LEGACY_ACTIVE=0
 
 declare -a GPU_ARGS=()
 declare -a GPUS=()
@@ -417,7 +424,7 @@ check_source_tree() {
 # the healthy instance of another GPU.
 rollback() {
   local rc=$?
-  local unit entry dst backup was_enabled was_active
+  local unit entry dst backup was_enabled was_active restore_failed=0
   trap - ERR INT TERM
   set +e
   error "msg=\"install failed, rolling back\" rc=$rc"
@@ -485,6 +492,55 @@ rollback() {
     systemctl reset-failed 'nvidia-idle-clock@*' >/dev/null 2>&1 || true
   fi
 
+  # The legacy unit was stopped and disabled by remove_legacy_unit(); its file
+  # is back in place, so restore the service state as well. Otherwise a failed
+  # install would leave a previously working installation inactive.
+  if [ "$PRE_LEGACY_SNAPSHOT" -eq 1 ]; then
+    if [ "$PRE_LEGACY_ENABLED" -eq 1 ]; then
+      if systemctl enable "$LEGACY_UNIT_NAME" >/dev/null 2>&1; then
+        warn "msg=\"re-enabled the legacy unit\" unit=\"$LEGACY_UNIT_NAME\""
+      else
+        error "msg=\"could not re-enable the legacy unit\" unit=\"$LEGACY_UNIT_NAME\" hint=\"systemctl enable $LEGACY_UNIT_NAME\""
+      fi
+    fi
+    if [ "$PRE_LEGACY_ACTIVE" -eq 1 ]; then
+      if systemctl start "$LEGACY_UNIT_NAME" >/dev/null 2>&1; then
+        warn "msg=\"restarted the legacy unit\" unit=\"$LEGACY_UNIT_NAME\""
+      else
+        error "msg=\"could not restart the legacy unit\" unit=\"$LEGACY_UNIT_NAME\" hint=\"systemctl start $LEGACY_UNIT_NAME\""
+      fi
+    fi
+  fi
+
+  # Do not claim the previous state was restored unless every snapshotted
+  # unit is really back in its old enabled/active state.
+  for unit in ${PRE_ENABLED[@]+"${PRE_ENABLED[@]}"}; do
+    if ! systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      error "msg=\"could not restore the enabled state\" unit=\"$unit\" hint=\"systemctl enable $unit\""
+      restore_failed=1
+    fi
+  done
+  for unit in ${PRE_ACTIVE[@]+"${PRE_ACTIVE[@]}"}; do
+    if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+      error "msg=\"could not restore the active state\" unit=\"$unit\" hint=\"systemctl start $unit\""
+      restore_failed=1
+    fi
+  done
+  if [ "$PRE_LEGACY_SNAPSHOT" -eq 1 ] && [ "$PRE_LEGACY_ENABLED" -eq 1 ] \
+    && ! systemctl is-enabled --quiet "$LEGACY_UNIT_NAME" 2>/dev/null; then
+    error "msg=\"could not restore the enabled state\" unit=\"$LEGACY_UNIT_NAME\" hint=\"systemctl enable $LEGACY_UNIT_NAME\""
+    restore_failed=1
+  fi
+  if [ "$PRE_LEGACY_SNAPSHOT" -eq 1 ] && [ "$PRE_LEGACY_ACTIVE" -eq 1 ] \
+    && ! systemctl is-active --quiet "$LEGACY_UNIT_NAME" 2>/dev/null; then
+    error "msg=\"could not restore the active state\" unit=\"$LEGACY_UNIT_NAME\" hint=\"systemctl start $LEGACY_UNIT_NAME\""
+    restore_failed=1
+  fi
+
+  if [ "$restore_failed" -ne 0 ]; then
+    error "msg=\"rollback could not restore the previous state\" hint=\"inspect the units named above with systemctl status\""
+    exit 1
+  fi
   error "msg=\"rollback finished: the previous state was restored, nothing was installed\""
   exit "$rc"
 }
@@ -577,8 +633,10 @@ daemon_reload() {
 # Record the enabled and active state of every target unit before this run
 # changes anything. rollback() uses it to undo only what the run did (#46):
 # a pre-existing enabled+active instance must survive a failed install.
+# The legacy non-template unit is snapshotted too: remove_legacy_unit stops
+# and disables it, so a rollback has to bring it back as well.
 capture_unit_state() {
-  local gpu unit
+  local gpu unit legacy_load_state
   for gpu in ${GPUS[@]+"${GPUS[@]}"}; do
     unit="$(unit_name "$gpu")"
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
@@ -588,11 +646,37 @@ capture_unit_state() {
       PRE_ENABLED+=("$unit")
     fi
   done
+  legacy_load_state="$(systemctl show -p LoadState --value "$LEGACY_UNIT_NAME" 2>/dev/null || true)"
+  if [ -e "$LEGACY_UNIT" ] || [ "$legacy_load_state" != "not-found" ]; then
+    PRE_LEGACY_SNAPSHOT=1
+    if systemctl is-active --quiet "$LEGACY_UNIT_NAME" 2>/dev/null; then
+      PRE_LEGACY_ACTIVE=1
+    fi
+    if systemctl is-enabled --quiet "$LEGACY_UNIT_NAME" 2>/dev/null; then
+      PRE_LEGACY_ENABLED=1
+    fi
+    if [ "$PRE_LEGACY_ENABLED" -eq 1 ] || [ "$PRE_LEGACY_ACTIVE" -eq 1 ]; then
+      info "msg=\"legacy unit state captured before this run\" unit=\"$LEGACY_UNIT_NAME\" enabled=$PRE_LEGACY_ENABLED active=$PRE_LEGACY_ACTIVE"
+    fi
+  fi
   if [ "${#PRE_ACTIVE[@]}" -gt 0 ]; then
     info "msg=\"instances already active before this run\" units=\"${PRE_ACTIVE[*]}\""
   fi
   if [ "${#PRE_ENABLED[@]}" -gt 0 ]; then
     info "msg=\"instances already enabled before this run\" units=\"${PRE_ENABLED[*]}\""
+  fi
+}
+
+# uninstall.sh --keep-clocks leaves a marker that is meant for the current
+# boot only. If it survived a reinstall, the new daemon would never release
+# the clocks (#48), so a real install clears it before any unit is enabled.
+clear_stale_keep_clocks() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return 0
+  fi
+  if [ -e "$KEEP_CLOCKS_MARKER" ] || [ -L "$KEEP_CLOCKS_MARKER" ]; then
+    rm -f -- "$KEEP_CLOCKS_MARKER"
+    info "msg=\"cleared stale keep-clocks marker\" path=\"$KEEP_CLOCKS_MARKER\""
   fi
 }
 
@@ -712,6 +796,7 @@ main() {
   remove_legacy_unit
   daemon_reload
   verify_installed
+  clear_stale_keep_clocks
   enable_units
 
   # The installation itself is complete and consistent: stop undoing it. A
