@@ -224,22 +224,49 @@ for _g in "${GPU_IDS[@]}"; do
 done
 unset _g _max
 
+# --- wall clock ------------------------------------------------------------
+# Idle time is measured with a monotonic-enough wall clock instead of counting
+# CSV lines: one line is not necessarily one SAMPLE_MS of elapsed time, so the
+# documented IDLE_SECONDS only held when the stream kept the requested cadence
+# (issue #19). EPOCHREALTIME (bash 5) costs no fork; `date +%s%3N` needs GNU
+# date; SECONDS is the coarse fallback that always exists.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+  NOW_SOURCE=realtime
+elif [[ "$(date +%s%3N 2>/dev/null || true)" =~ ^[0-9]{13,}$ ]]; then
+  NOW_SOURCE=gnu_date
+else
+  NOW_SOURCE=seconds
+fi
+
+now_ms() { # sets NOW_MS (ms); the decimal separator is locale dependent
+  case "$NOW_SOURCE" in
+    realtime) NOW_MS=$(( ${EPOCHREALTIME//[!0-9]/} / 1000 )) ;;
+    gnu_date) NOW_MS=$(date +%s%3N) ;;
+    *) NOW_MS=$(( SECONDS * 1000 )) ;;
+  esac
+}
+
 # --- per-GPU state ---------------------------------------------------------
 # LOCKED      1 when we have verified a clock range lock
-# IDLE_MS     accumulated idle time
+# IDLE_MS     accumulated idle time (wall clock, see #19)
+# LAST_MS     wall-clock timestamp of the last sample counted for IDLE_MS
 # ASSERT_MS   time since the last successful re-assert
 # CLAMP_FAIL  consecutive failed idle clamp attempts (drives the backoff)
 # RETRY_MS    remaining backoff before the next clamp attempt
+# UNKNOWN     consecutive non-numeric utilization samples (one log per streak)
 # REASSERT_FAIL  a re-assert failure was already logged (one line per streak)
 # UNLOCK_FAIL    an unlock failure was already logged
-declare -A LOCKED=() IDLE_MS=() ASSERT_MS=() CLAMP_FAIL=() RETRY_MS=()
-declare -A REASSERT_FAIL=() UNLOCK_FAIL=()
+declare -A LOCKED=() IDLE_MS=() LAST_MS=() ASSERT_MS=() CLAMP_FAIL=() RETRY_MS=()
+declare -A UNKNOWN=() REASSERT_FAIL=() UNLOCK_FAIL=()
+now_ms
 for g in "${GPU_IDS[@]}"; do
   LOCKED[$g]=0
   IDLE_MS[$g]=0
+  LAST_MS[$g]=$NOW_MS
   ASSERT_MS[$g]=0
   CLAMP_FAIL[$g]=0
   RETRY_MS[$g]=0
+  UNKNOWN[$g]=0
   REASSERT_FAIL[$g]=0
   UNLOCK_FAIL[$g]=0
 done
@@ -332,6 +359,7 @@ unlock_gpu() { # index trigger [util_pct]
     UNLOCK_FAIL[$idx]=0
     case "$trigger" in
       util) log info "unlocked" "gpu=$idx" "trigger=util" "util_pct=${util:-?}" ;;
+      unavailable) log info "unlocked" "gpu=$idx" "trigger=unavailable" ;;
       exit) log info "unlocked" "gpu=$idx" "trigger=exit" ;;
     esac
     return 0
@@ -345,11 +373,44 @@ unlock_gpu() { # index trigger [util_pct]
 }
 
 unlock_all() { # trigger
+  # A trap handler can run while `while IFS= read` still has its temporary IFS
+  # in effect, and word splitting would then turn "0 1" into one argument for
+  # -i (issue #5). The array iteration keeps this correct; fixing IFS here is
+  # the belt to that suspenders.
+  local IFS=$' \t\n'
   local g failed=0
   for g in "${GPU_IDS[@]}"; do
     if ! unlock_gpu "$g" "$1" ""; then failed=1; fi
   done
   return "$failed"
+}
+
+# --- utilization stream ----------------------------------------------------
+# The stream runs as a coprocess rather than a process substitution because a
+# stalled nvidia-smi has to be killed, and a process substitution does not
+# expose its PID. `exec` makes the recorded PID the tool itself, so the kill
+# reaches it even when stdbuf is in use (stdbuf also execs). The reference is
+# cleared by bash once the child is reaped, hence the ${...:-} guards.
+start_util_stream() {
+  coproc UTIL_STREAM {
+    exec 2>"$STREAM_ERR"
+    exec "${STDBUF_LIST[@]+"${STDBUF_LIST[@]}"}" "$NVSMI" -i "$IDS" \
+      --query-gpu=index,utilization.gpu --format=csv,noheader,nounits \
+      --loop-ms="$SAMPLE_MS"
+  }
+  STREAM_FD="${UTIL_STREAM[0]}"
+}
+
+stop_util_stream() {
+  local pid="${UTIL_STREAM_PID:-}"
+  UTIL_STREAM_PID=""
+  if [ -z "$pid" ]; then return 0; fi
+  kill -TERM "$pid" 2>/dev/null || true
+  # Give a cooperative child a moment, then make sure a stalled one cannot
+  # outlive the daemon: nvidia-smi is a stateless query, so KILL is safe (#7).
+  sleep 0.05
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 
 # --- shutdown --------------------------------------------------------------
@@ -362,6 +423,13 @@ unlock_all() { # trigger
 cleanup() { # status to preserve
   local rc="$1" unlocked=0
   trap - INT TERM EXIT
+  # Nothing started by this daemon may outlive it: a stalled utilization stream
+  # and the reconnect timer are both stopped here (issue #7).
+  stop_util_stream
+  if [ -n "${SLEEP_PID:-}" ]; then
+    kill -KILL "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
+  fi
   if [ -n "$STREAM_ERR" ] && [ "$STREAM_ERR" != "/dev/null" ]; then rm -f "$STREAM_ERR"; fi
   if unlock_all exit; then unlocked=1; fi
   if [ "$unlocked" -eq 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
@@ -378,12 +446,31 @@ cleanup() { # status to preserve
 STDBUF_LIST=()
 if command -v stdbuf >/dev/null 2>&1; then STDBUF_LIST=(stdbuf -oL); fi
 
+# A utilization stream that stops producing samples is not a normal EOF: with a
+# clamp in place nothing observes the GPU any more. read -t gives up after
+# max(5 s, 5 samples), the child is killed and the daemon exits non-zero so
+# Restart=on-failure rebuilds the unit (issue #7).
+STREAM_TIMEOUT_S=$(( (SAMPLE_MS * 5 + 999) / 1000 ))
+if [ "$STREAM_TIMEOUT_S" -lt 5 ]; then STREAM_TIMEOUT_S=5; fi
+# Consecutive failed connections tolerated inside one minute. With the 2/4/8/16 s
+# backoff the fifth attempt lands at ~30 s, so a stream that never comes back
+# ends the unit instead of reconnecting forever (issue #7).
+RECONNECT_MAX=5
+RECONNECT_WINDOW_MS=60000
+
 # First stderr line of the utilization stream, so a missing driver or tool is
 # visible instead of being discarded.
 STREAM_ERR=$(mktemp "${TMPDIR:-/tmp}/nvidia-idle-clock.XXXXXX" 2>/dev/null) || STREAM_ERR=/dev/null
 RETRY_S=$RETRY_MIN_S
 STREAM_LOGGED=0
 LAST_STREAM_ERR=""
+STREAM_SAMPLES=0
+STREAM_READ_RC=0
+STREAM_FAILS=0
+STREAM_FAIL_FIRST_MS=0
+STREAM_FD=""
+UTIL_STREAM_PID=""
+SLEEP_PID=""
 
 trap 'cleanup $?' EXIT
 trap 'cleanup 0' INT TERM
@@ -398,14 +485,53 @@ log info "started" "gpu=$IDS" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" \
 
 while :; do
   STREAM_SAMPLES=0
-  while IFS= read -r line; do
+  start_util_stream
+  # Time between two connections is unobserved, so it must not count as idle
+  # time: a reconnect gap would otherwise clamp a GPU that was busy throughout
+  # (issue #19).
+  now_ms
+  for g in "${GPU_IDS[@]}"; do LAST_MS[$g]=$NOW_MS; done
+
+  # read -t ends the wait when the stream stops delivering: a stalled nvidia-smi
+  # never returns EOF, so a plain `while read` waited forever with a clamp in
+  # place (issue #7).
+  while :; do
+    IFS= read -r -t "$STREAM_TIMEOUT_S" -u "$STREAM_FD" line
+    STREAM_READ_RC=$?
+    if [ "$STREAM_READ_RC" -ne 0 ]; then break; fi
+
     index="${line%%,*}"
     util="${line#*,}"
     index="${index//[^0-9]/}"
-    util="${util//[^0-9]/}"
-    if [ -z "$index" ] || [ -z "$util" ]; then continue; fi
+    if [ -z "$index" ]; then continue; fi
     if [ -z "${LOCKED[$index]+x}" ]; then continue; fi
     STREAM_SAMPLES=$(( STREAM_SAMPLES + 1 ))
+
+    # Idle time is wall time, not one SAMPLE_MS per CSV line: the documented
+    # IDLE_SECONDS has to hold even when the stream keeps another cadence
+    # (issue #19). A backwards clock jump contributes nothing.
+    now_ms
+    last="${LAST_MS[$index]:-$NOW_MS}"
+    delta=$(( NOW_MS - last ))
+    if [ "$delta" -gt 0 ]; then
+      IDLE_MS[$index]=$(( ${IDLE_MS[$index]} + delta ))
+    fi
+    LAST_MS[$index]=$NOW_MS
+
+    util="${util//[^0-9]/}"
+    if [ -z "$util" ]; then
+      # [N/A] / [Not Supported]: an unreadable GPU is not an idle one. The clamp,
+      # if held, is released (safe side), the idle clock does not advance and the
+      # event is logged once per streak (issue #8).
+      UNKNOWN[$index]=$(( ${UNKNOWN[$index]} + 1 ))
+      if [ "${UNKNOWN[$index]}" -eq 1 ]; then
+        log warn "utilization unavailable" "gpu=$index" "raw=\"$(oneline "$line")\""
+      fi
+      IDLE_MS[$index]=0
+      if [ "${LOCKED[$index]}" -eq 1 ]; then unlock_gpu "$index" unavailable; fi
+      continue
+    fi
+    UNKNOWN[$index]=0
 
     if [ "$util" -gt "$UTIL_THRESHOLD" ]; then
       IDLE_MS[$index]=0
@@ -422,8 +548,6 @@ while :; do
       RETRY_MS[$index]=$(( ${RETRY_MS[$index]} - SAMPLE_MS ))
       continue
     fi
-
-    IDLE_MS[$index]=$(( ${IDLE_MS[$index]} + SAMPLE_MS ))
 
     if [ "${LOCKED[$index]}" -eq 1 ]; then
       ASSERT_MS[$index]=$(( ${ASSERT_MS[$index]} + SAMPLE_MS ))
@@ -454,9 +578,18 @@ while :; do
     else
       RETRY_MS[$index]=$(( $(backoff_seconds "${CLAMP_FAIL[$index]}") * 1000 ))
     fi
-  done < <( "${STDBUF_LIST[@]+"${STDBUF_LIST[@]}"}" "$NVSMI" -i "$IDS" \
-             --query-gpu=index,utilization.gpu --format=csv,noheader,nounits \
-             --loop-ms="$SAMPLE_MS" 2>"$STREAM_ERR" )
+  done
+
+  # The child is done (EOF) or produced nothing for STREAM_TIMEOUT_S. Either way
+  # it is stopped here so nothing outlives the daemon (issue #7).
+  stop_util_stream
+
+  # read -t returns >128 on timeout: the child is alive but not delivering, which
+  # is the stalled-stream case the plain read could not escape from (issue #7).
+  if [ "$STREAM_READ_RC" -gt 128 ]; then
+    log error "utilization stream stale" "gpu=$IDS" "timeout_s=$STREAM_TIMEOUT_S"
+    exit 1
+  fi
 
   # The stream ended. Report the one reason we have, then back off instead of
   # reconnecting every 2 s forever (issue #24).
@@ -473,11 +606,31 @@ while :; do
     STREAM_LOGGED=1
     LAST_STREAM_ERR="$first_err"
   fi
+
+  # Every ended connection is a reconnect attempt. The streak is only fatal when
+  # RECONNECT_MAX of them land inside RECONNECT_WINDOW_MS, so a stream that dies
+  # once a day keeps reconnecting while a stream that flaps or never returns
+  # ends the unit instead of hiding behind `active (running)` (issue #7).
+  now_ms
+  if [ "$STREAM_FAILS" -eq 0 ] \
+     || [ $(( NOW_MS - STREAM_FAIL_FIRST_MS )) -gt "$RECONNECT_WINDOW_MS" ]; then
+    STREAM_FAILS=0
+    STREAM_FAIL_FIRST_MS=$NOW_MS
+  fi
+  STREAM_FAILS=$(( STREAM_FAILS + 1 ))
+  if [ "$STREAM_FAILS" -ge "$RECONNECT_MAX" ]; then
+    log error "utilization stream unavailable" "gpu=$IDS" \
+      "attempts=$STREAM_FAILS" "stderr=\"$first_err\""
+    exit 1
+  fi
+
   # A foreground sleep defers signal handling until it returns; waiting on a
   # background sleep lets the TERM trap run immediately, so a stop is not delayed
   # by up to RETRY_MAX_S.
   sleep "$RETRY_S" &
-  wait $!
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
+  SLEEP_PID=""
   RETRY_S=$(( RETRY_S * 2 ))
   if [ "$RETRY_S" -gt "$RETRY_MAX_S" ]; then RETRY_S=$RETRY_MAX_S; fi
 done
