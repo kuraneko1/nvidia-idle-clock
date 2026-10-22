@@ -30,7 +30,7 @@
 set -uo pipefail
 
 # Release version reported by --version.
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 # --- tunables (environment / systemd drop-ins) -----------------------------
 GPU="${GPU:-0}"                        # target: comma separated index or UUID
