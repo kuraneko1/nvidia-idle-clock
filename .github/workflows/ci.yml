@@ -63,3 +63,10 @@ jobs:
           else
             echo "tests/run.sh not present yet - skipping"
           fi
+
+      - name: Run installer tests
+        run: |
+          # The installer suite shims every privileged command; the assertions
+          # that need a user namespace skip themselves when bwrap cannot
+          # create one, so this is safe on an unprivileged runner.
+          bash tests/installer/run.sh
