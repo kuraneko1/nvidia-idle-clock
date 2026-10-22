@@ -134,12 +134,20 @@ case "${1:-}" in
     exit 0
     ;;
   is-active)
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      [ -e "$SHIM_STATE_DIR/active/$unit" ] && exit 0
+      exit 3
+    fi
     case " ${FAKE_ACTIVE_UNITS:-} " in
       *" $unit "*) exit 0 ;;
       *) exit 3 ;;
     esac
     ;;
   is-enabled)
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      [ -e "$SHIM_STATE_DIR/enabled/$unit" ] && exit 0
+      exit 1
+    fi
     case " ${FAKE_ENABLED_UNITS:-} " in
       *" $unit "*) exit 0 ;;
       *) exit 1 ;;
@@ -155,6 +163,12 @@ case "${1:-}" in
     if [ -n "${FAKE_ENABLE_FAIL_UNIT:-}" ] && [ "$unit" = "$FAKE_ENABLE_FAIL_UNIT" ]; then
       printf 'Job for %s failed because the control process exited with error code.\n' "$unit" >&2
       exit 1
+    fi
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      mkdir -p "$SHIM_STATE_DIR/enabled" && : >"$SHIM_STATE_DIR/enabled/$unit"
+      case " $* " in
+        *" --now "*) mkdir -p "$SHIM_STATE_DIR/active" && : >"$SHIM_STATE_DIR/active/$unit" ;;
+      esac
     fi
     exit 0
     ;;
@@ -172,6 +186,28 @@ case "${1:-}" in
     if [ -n "${FAKE_DISABLE_FAIL_UNIT:-}" ] && [ "$unit" = "$FAKE_DISABLE_FAIL_UNIT" ]; then
       printf 'Failed to disable unit: Unit file is read-only.\n' >&2
       exit 1
+    fi
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      rm -f "$SHIM_STATE_DIR/enabled/$unit"
+      case " $* " in
+        *" --now "*) rm -f "$SHIM_STATE_DIR/active/$unit" ;;
+      esac
+    fi
+    exit 0
+    ;;
+  start)
+    if [ -n "${FAKE_START_FAIL_UNIT:-}" ] && [ "$unit" = "$FAKE_START_FAIL_UNIT" ]; then
+      printf 'Job for %s failed because the control process exited with error code.\n' "$unit" >&2
+      exit 1
+    fi
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      mkdir -p "$SHIM_STATE_DIR/active" && : >"$SHIM_STATE_DIR/active/$unit"
+    fi
+    exit 0
+    ;;
+  stop)
+    if [ -n "${SHIM_STATE_DIR:-}" ]; then
+      rm -f "$SHIM_STATE_DIR/active/$unit"
     fi
     exit 0
     ;;
@@ -300,6 +336,7 @@ run_in_sandbox() {
     --uid 0 --gid 0 \
     --setenv PATH "$SHIM_BWRAP:/usr/bin:/bin" \
     --setenv SHIM_LOG "$BLOG" \
+    --setenv STATE_DIR "$sb/state" \
     /bin/bash "$script" >"$sb/out/bwrap.out" 2>"$sb/out/bwrap.err"
   RC=$?
   OUT="$(<"$sb/out/bwrap.out")"
@@ -545,6 +582,23 @@ assert_not_contains "$LOG" "install " "dry-run does not call install"
 assert_not_contains "$LOG" "systemctl enable" "dry-run does not enable units"
 assert_not_contains "$LOG" "daemon-reload" "dry-run does not reload systemd"
 
+# #48: a stale keep-clocks marker must survive a dry run, which promises not
+# to change anything.
+KEEP_STATE="$WORK/keep-state"
+mkdir -p "$KEEP_STATE"
+: >"$KEEP_STATE/keep-clocks"
+reset_shim_log
+export STATE_DIR="$KEEP_STATE"
+run_install --dry-run 0
+assert_rc 0 "dry-run with a stale keep-clocks marker exits 0"
+if [ -e "$KEEP_STATE/keep-clocks" ]; then
+  ok "dry-run does not remove the keep-clocks marker"
+else
+  bad "dry-run does not remove the keep-clocks marker"
+fi
+assert_not_contains "$OUT" "cleared stale keep-clocks marker" "dry-run does not claim to clear the marker"
+unset STATE_DIR
+
 # --- source tree trust check (#23) -----------------------------------------
 make_tree() {
   local dir="$1"
@@ -679,6 +733,9 @@ if [ "$BWRAP_OK" -ne 1 ]; then
     "unchanged payload does not restart" \
     "rollback leaves a pre-existing instance alone" \
     "rollback undoes only the new enable" \
+    "rollback restores a legacy unit left enabled and active" \
+    "rollback does not claim a restore it could not verify" \
+    "install clears a stale keep-clocks marker" \
     "uninstall removes files and releases clocks" \
     "uninstall --dry-run plans the removal" \
     "uninstall fails when -rgc fails" \
@@ -794,6 +851,72 @@ export FAKE_ENABLE_FAIL_UNIT="nvidia-idle-clock@1.service"'
     "rollback does not stop an active-only unit with --now"
   assert_contains "$ERR" "left the running instance alone" "rollback explains that the instance was left running"
 
+  # #55: a legacy non-template unit that was enabled and active before the run
+  # was stopped and disabled by the install. A later failure must restore that
+  # state, not just the file.
+  new_sandbox rollback-legacy
+  printf '[Unit]\nDescription=legacy unit\n' >"$SB/etc_systemd/nvidia-idle-clock.service"
+  mkdir -p "$SB/state/enabled" "$SB/state/active"
+  : >"$SB/state/enabled/nvidia-idle-clock.service"
+  : >"$SB/state/active/nvidia-idle-clock.service"
+  write_inner_install "$SB/out/inner.sh" "0" \
+    "export SHIM_STATE_DIR='$SB/state'
+export FAKE_ENABLE_FAIL_UNIT='nvidia-idle-clock@0.service'"
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_nonzero_rc "failed enable after disabling the legacy unit exits non-zero"
+  assert_contains "$OUT" "legacy unit state captured before this run" "the legacy unit state is snapshotted"
+  assert_contains "$LOG" "systemctl disable --now nvidia-idle-clock.service" \
+    "the install disables the legacy unit"
+  assert_contains "$LOG" "systemctl enable nvidia-idle-clock.service" \
+    "rollback re-enables the legacy unit"
+  assert_contains "$LOG" "systemctl start nvidia-idle-clock.service" \
+    "rollback restarts the legacy unit"
+  assert_contains "$ERR" "re-enabled the legacy unit" "the legacy re-enable is reported"
+  assert_contains "$ERR" "restarted the legacy unit" "the legacy restart is reported"
+  assert_contains "$ERR" "previous state was restored" "rollback reports the restored state"
+  assert_not_contains "$ERR" "could not restore" "rollback reports no failed restoration"
+  if [ -e "$SB/etc_systemd/nvidia-idle-clock.service" ]; then
+    ok "rollback restores the legacy unit file"
+  else
+    bad "rollback restores the legacy unit file"
+  fi
+  if [ -e "$SB/state/enabled/nvidia-idle-clock.service" ] \
+    && [ -e "$SB/state/active/nvidia-idle-clock.service" ]; then
+    ok "the legacy unit ends enabled and active"
+  else
+    bad "the legacy unit ends enabled and active"
+  fi
+
+  # #55: when a snapshotted unit cannot actually be restored, rollback must
+  # name it and must not print that the previous state was restored.
+  new_sandbox rollback-legacy-unrestored
+  printf '[Unit]\nDescription=legacy unit\n' >"$SB/etc_systemd/nvidia-idle-clock.service"
+  mkdir -p "$SB/state/enabled" "$SB/state/active"
+  : >"$SB/state/enabled/nvidia-idle-clock.service"
+  : >"$SB/state/active/nvidia-idle-clock.service"
+  write_inner_install "$SB/out/inner.sh" "0" \
+    "export SHIM_STATE_DIR='$SB/state'
+export FAKE_ENABLE_FAIL_UNIT='nvidia-idle-clock@0.service'
+export FAKE_START_FAIL_UNIT='nvidia-idle-clock.service'"
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_nonzero_rc "a rollback that cannot restart the legacy unit exits non-zero"
+  assert_contains "$LOG" "systemctl enable nvidia-idle-clock.service" \
+    "rollback still tries to re-enable the legacy unit"
+  assert_contains "$ERR" "could not restart the legacy unit" "the failed legacy restart is reported"
+  assert_contains "$ERR" "could not restore the active state" \
+    "rollback names the state it could not restore"
+  assert_contains "$ERR" "rollback could not restore the previous state" \
+    "rollback reports that the restore was incomplete"
+  assert_not_contains "$ERR" "previous state was restored" \
+    "rollback does not lie about the restored state"
+  if [ -e "$SB/state/active/nvidia-idle-clock.service" ]; then
+    bad "a failed legacy restart is not reported as active"
+  else
+    ok "a failed legacy restart is not reported as active"
+  fi
+
   # #13: a replaced file must be restored when a later step fails.
   new_sandbox rollback-restore
   printf '#!/bin/sh\n# old version\nexit 0\n' >"$SB/usr_local_sbin/nvidia-idle-clock"
@@ -834,6 +957,34 @@ export FAKE_RESTART_FAIL_UNIT="nvidia-idle-clock@0.service"'
   assert_rc 0 "reinstall with identical payload exits 0"
   assert_contains "$OUT" "payload unchanged" "identical payload is reported as unchanged"
   assert_not_contains "$LOG" "try-restart" "identical payload does not restart the instance"
+
+  # #48: "uninstall.sh --keep-clocks" leaves a marker for the current boot.
+  # A successful install must clear it before enabling the units, otherwise
+  # the new daemon would honour it forever; nothing else in the state
+  # directory may be touched.
+  new_sandbox keep-clocks-stale
+  mkdir -p "$SB/state"
+  : >"$SB/state/keep-clocks"
+  : >"$SB/state/unrelated"
+  write_inner_install "$SB/out/inner.sh" "0" \
+    "export STATE_DIR='$SB/state'"
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_rc 0 "install with a stale keep-clocks marker exits 0"
+  assert_contains "$OUT" "cleared stale keep-clocks marker" "the stale keep-clocks marker is cleared"
+  assert_contains "$OUT" "install complete" "the install still completes"
+  assert_contains "$LOG" "systemctl enable --now nvidia-idle-clock@0.service" \
+    "the units are enabled after the marker is cleared"
+  if [ -e "$SB/state/keep-clocks" ]; then
+    bad "the keep-clocks marker is gone after a successful install"
+  else
+    ok "the keep-clocks marker is gone after a successful install"
+  fi
+  if [ -e "$SB/state/unrelated" ]; then
+    ok "the rest of the state directory is left alone"
+  else
+    bad "the rest of the state directory is left alone"
+  fi
 
   printf '\n== uninstall.sh: removal and clock release (bwrap sandbox) ==\n'
 
