@@ -19,6 +19,9 @@
 #   nvidia-idle-clock@<GPU index>.service   (Environment=GPU=%i)
 set -uo pipefail
 
+# Release version reported by --version.
+VERSION="0.2.0"
+
 # --- tunables (environment / systemd drop-ins) -----------------------------
 GPU="${GPU:-0}"                        # target: comma separated index or UUID
 IDLE_CAP="${IDLE_CAP:-135}"            # upper clock while idle (MHz)
@@ -66,6 +69,77 @@ log() {
   for field in "$@"; do line+=" $field"; done
   printf '%s\n' "$line"
 }
+
+# --- command line ----------------------------------------------------------
+# Parsed before configuration validation and before any nvidia-smi call, so
+# --help/--version/--dry-run are safe on a live GPU and a typo cannot start the
+# daemon and unlock clocks (issue #25).
+usage_line() {
+  printf 'usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run]\n'
+}
+
+usage() {
+  usage_line
+  cat <<'EOF'
+
+Run the idle-clock daemon. With no arguments it starts in the foreground and
+runs until SIGTERM/SIGINT (systemd Type=simple). It clamps the graphics clock
+range of an idle GPU and releases the lock as soon as the GPU is used again.
+
+options:
+  -h, --help     show this help and exit
+  -V, --version  show the version and exit
+  -n, --dry-run  validate the configuration, print the resolved plan and exit
+                 without locking or unlocking clocks and without entering the
+                 loop
+
+environment variables (all optional; the numeric knobs are validated before
+the daemon touches a GPU):
+  GPU                 target GPU index or UUID, comma separated (default: 0)
+  MIN_CLK             lower clock of the idle lock in MHz (default: 135)
+  IDLE_CAP            upper clock while idle in MHz (default: 135)
+  IDLE_SECONDS        idle time before clamping in seconds (default: 30)
+  SAMPLE_MS           utilization sampling interval in ms (default: 200)
+  UTIL_THRESHOLD      utilization <= this counts as idle in percent (default: 0)
+  REASSERT_SECONDS    re-apply the lock this often while locked in s (default: 30)
+  SKIP_IF_LOW         1 = do not clamp a GPU that already idles low (default: 1)
+  NVSMI               path to nvidia-smi; empty = resolve from PATH
+
+exit status:
+  0  clean stop, or --help / --version / --dry-run succeeded
+  1  runtime failure (no usable GPU, nvidia-smi missing, unlock failed)
+  2  invalid configuration or unknown argument
+
+examples:
+  nvidia-idle-clock --help
+  nvidia-idle-clock --version
+  GPU=0 nvidia-idle-clock --dry-run
+  GPU=0 nvidia-idle-clock
+EOF
+}
+
+DRY_RUN=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -V | --version)
+      printf 'nvidia-idle-clock %s\n' "$VERSION"
+      exit 0
+      ;;
+    -n | --dry-run)
+      DRY_RUN=1
+      ;;
+    *)
+      log error "unknown argument" "arg=$1"
+      usage_line >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 # --- configuration validation ----------------------------------------------
 # Fatal configuration errors exit 2 before the EXIT trap exists, so the status is
@@ -223,6 +297,20 @@ for _g in "${GPU_IDS[@]}"; do
   fi
 done
 unset _g _max
+
+# --- dry run ---------------------------------------------------------------
+# Configuration, nvidia-smi and the target GPUs are resolved exactly as the
+# daemon would resolve them, then the plan is printed and nothing is changed.
+# No -lgc/-rgc call is made and the loop is never entered (issue #25).
+if [ "$DRY_RUN" -eq 1 ]; then
+  log info "dry run" "gpu=$IDS" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" \
+    "idle_s=$IDLE_SECONDS" "sample_ms=$SAMPLE_MS" "nvidia_smi=$NVSMI"
+  log info "would clamp when idle" "gpu=$IDS" "after_idle_s=$IDLE_SECONDS" \
+    "util_threshold_pct=$UTIL_THRESHOLD" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" \
+    "skip_if_low=$SKIP_IF_LOW"
+  log info "would unlock on use or exit" "gpu=$IDS" "trigger=util,exit"
+  exit 0
+fi
 
 # --- per-GPU state ---------------------------------------------------------
 # LOCKED      1 when we have verified a clock range lock
