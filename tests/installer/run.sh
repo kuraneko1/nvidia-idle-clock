@@ -139,6 +139,12 @@ case "${1:-}" in
       *) exit 3 ;;
     esac
     ;;
+  is-enabled)
+    case " ${FAKE_ENABLED_UNITS:-} " in
+      *" $unit "*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
   list-units)
     for u in ${FAKE_UNITS:-}; do
       printf '%s loaded active running test\n' "$u"
@@ -153,6 +159,16 @@ case "${1:-}" in
     exit 0
     ;;
   disable)
+    # #48: record whether the --keep-clocks marker existed when the unit was
+    # stopped. The shim cannot run the daemon or ExecStopPost, so this proves
+    # the ordering (marker before the first stop), not the clamp itself.
+    if [ -n "${TEST_MARKER:-}" ] && [ -n "${SHIM_LOG:-}" ]; then
+      if [ -e "$TEST_MARKER" ]; then
+        printf 'marker=present before systemctl %s\n' "$*" >>"$SHIM_LOG"
+      else
+        printf 'marker=absent before systemctl %s\n' "$*" >>"$SHIM_LOG"
+      fi
+    fi
     if [ -n "${FAKE_DISABLE_FAIL_UNIT:-}" ] && [ "$unit" = "$FAKE_DISABLE_FAIL_UNIT" ]; then
       printf 'Failed to disable unit: Unit file is read-only.\n' >&2
       exit 1
@@ -661,10 +677,15 @@ if [ "$BWRAP_OK" -ne 1 ]; then
     "failed install restores the previous file" \
     "failed restart does not roll back" \
     "unchanged payload does not restart" \
+    "rollback leaves a pre-existing instance alone" \
+    "rollback undoes only the new enable" \
     "uninstall removes files and releases clocks" \
     "uninstall --dry-run plans the removal" \
     "uninstall fails when -rgc fails" \
     "uninstall --keep-clocks skips -rgc" \
+    "uninstall --keep-clocks writes the marker before the stop" \
+    "uninstall --keep-clocks failure removes the marker" \
+    "uninstall without --keep-clocks writes no marker" \
     "uninstall aborts when a unit cannot be stopped"; do
     skip "$name" "bwrap user namespace not available"
   done
@@ -731,6 +752,47 @@ else
   else
     ok "rollback removes the newly created unit"
   fi
+
+  # #46: GPU 0 already ran before the install (enabled and active). A failed
+  # enable of GPU 1 must not stop or disable that healthy instance.
+  new_sandbox rollback-preexisting
+  write_inner_install "$SB/out/inner.sh" "0 1" \
+    'export FAKE_ACTIVE_UNITS="nvidia-idle-clock@0.service"
+export FAKE_ENABLED_UNITS="nvidia-idle-clock@0.service"
+export FAKE_ENABLE_FAIL_UNIT="nvidia-idle-clock@1.service"'
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_nonzero_rc "failed enable with a pre-existing instance exits non-zero"
+  assert_contains "$ERR" "rolling back" "rollback with a pre-existing instance is announced"
+  assert_not_contains "$LOG" "systemctl disable --now nvidia-idle-clock@0.service" \
+    "rollback does not disable --now a pre-existing enabled+active unit"
+  assert_not_contains "$LOG" "systemctl disable nvidia-idle-clock@0.service" \
+    "rollback does not disable a pre-existing enabled unit"
+  assert_not_contains "$LOG" "systemctl stop nvidia-idle-clock@0.service" \
+    "rollback does not stop a pre-existing active unit"
+  assert_contains "$LOG" "systemctl disable --now nvidia-idle-clock@1.service" \
+    "rollback still cleans up the unit this run enabled"
+  assert_contains "$OUT" "instances already active before this run" "the active state is captured first"
+  assert_contains "$OUT" "instances already enabled before this run" "the enabled state is captured first"
+  assert_contains "$ERR" "left unit alone" "rollback reports the pre-existing unit as untouched"
+  assert_contains "$ERR" "rollback finished" "rollback with a pre-existing instance reports completion"
+
+  # #46: a unit that was active but not enabled must keep running after the
+  # rollback; only the enable this run added is undone.
+  new_sandbox rollback-active-only
+  write_inner_install "$SB/out/inner.sh" "0 1" \
+    'export FAKE_ACTIVE_UNITS="nvidia-idle-clock@0.service"
+export FAKE_ENABLE_FAIL_UNIT="nvidia-idle-clock@1.service"'
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_nonzero_rc "failed enable with an active-only instance exits non-zero"
+  assert_contains "$LOG" "systemctl disable nvidia-idle-clock@0.service" \
+    "rollback undoes the enable of an active-only unit"
+  assert_not_contains "$LOG" "systemctl stop nvidia-idle-clock@0.service" \
+    "rollback does not stop an active-only unit"
+  assert_not_contains "$LOG" "disable --now nvidia-idle-clock@0.service" \
+    "rollback does not stop an active-only unit with --now"
+  assert_contains "$ERR" "left the running instance alone" "rollback explains that the instance was left running"
 
   # #13: a replaced file must be restored when a later step fails.
   new_sandbox rollback-restore
@@ -826,16 +888,66 @@ export FAKE_RGC_RC=6'
   assert_not_contains "$OUT" "uninstall complete" "failed -rgc does not claim success"
   assert_contains "$ERR" "uninstall incomplete" "failed -rgc is summarised"
 
-  # --keep-clocks leaves the clock alone on purpose.
+  # #48: --keep-clocks must create the marker before the first stop, because
+  # the daemon's shutdown and ExecStopPost --unlock release the clamp from
+  # inside "systemctl disable --now". The shim records the marker state at
+  # every disable call instead of running the real daemon.
   new_sandbox uninstall-keep
   printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/usr_local_sbin/nvidia-idle-clock"
   write_inner_uninstall "$SB/out/inner.sh" "--keep-clocks" \
-    'export FAKE_UNITS="nvidia-idle-clock@0.service"'
+    'export FAKE_UNITS="nvidia-idle-clock@0.service"
+export STATE_DIR="'"$SB"'/state"
+export TEST_MARKER="'"$SB"'/state/keep-clocks"'
   run_in_sandbox "$SB" "$SB/out/inner.sh"
   LOG="$(bwrap_log)"
   assert_rc 0 "uninstall --keep-clocks exits 0"
   assert_contains "$OUT" "clock locks kept" "--keep-clocks reports the kept clocks"
+  assert_contains "$OUT" "kept until reboot" "--keep-clocks says the limit lasts until reboot"
   assert_not_contains "$LOG" "-rgc" "--keep-clocks does not release clocks"
+  assert_contains "$LOG" "marker=present before systemctl disable --now nvidia-idle-clock@0.service" \
+    "the keep-clocks marker exists before the first disable --now"
+  assert_equal "$(file_mode "$SB/state/keep-clocks")" "600" "the keep-clocks marker is mode 0600"
+  assert_equal "$(file_mode "$SB/state")" "700" "the state directory is mode 0700"
+
+  # #48: a failed run must remove the marker again, so a later stop behaves
+  # normally instead of silently keeping a clamp nobody asked to keep.
+  new_sandbox uninstall-keep-fail
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/usr_local_sbin/nvidia-idle-clock"
+  write_inner_uninstall "$SB/out/inner.sh" "--keep-clocks" \
+    'export FAKE_UNITS="nvidia-idle-clock@0.service"
+export FAKE_DISABLE_FAIL_UNIT="nvidia-idle-clock@0.service"
+export STATE_DIR="'"$SB"'/state"
+export TEST_MARKER="'"$SB"'/state/keep-clocks"'
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_nonzero_rc "failed stop with --keep-clocks exits non-zero"
+  assert_contains "$LOG" "marker=present before systemctl disable --now nvidia-idle-clock@0.service" \
+    "the marker exists before the stop that fails"
+  if [ -e "$SB/state/keep-clocks" ]; then
+    bad "a failed run removes the keep-clocks marker"
+  else
+    ok "a failed run removes the keep-clocks marker"
+  fi
+  assert_contains "$ERR" "removed the keep-clocks marker after a failed run" \
+    "the marker removal after a failure is reported"
+
+  # #48: without --keep-clocks nothing is created and the stop releases as usual.
+  new_sandbox uninstall-no-keep
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/usr_local_sbin/nvidia-idle-clock"
+  write_inner_uninstall "$SB/out/inner.sh" "" \
+    'export FAKE_UNITS="nvidia-idle-clock@0.service"
+export STATE_DIR="'"$SB"'/state"
+export TEST_MARKER="'"$SB"'/state/keep-clocks"'
+  run_in_sandbox "$SB" "$SB/out/inner.sh"
+  LOG="$(bwrap_log)"
+  assert_rc 0 "uninstall without --keep-clocks exits 0"
+  assert_contains "$LOG" "marker=absent before systemctl disable --now nvidia-idle-clock@0.service" \
+    "the stop runs without a keep-clocks marker"
+  if [ -e "$SB/state/keep-clocks" ]; then
+    bad "no keep-clocks marker is created without --keep-clocks"
+  else
+    ok "no keep-clocks marker is created without --keep-clocks"
+  fi
 
   # #14: if a unit cannot be stopped, the files must stay in place.
   new_sandbox uninstall-stop
