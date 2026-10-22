@@ -28,13 +28,63 @@ OUT="$WORK/out.log"
 ERR="$WORK/err.log"
 ARGV="$WORK/state/argv.log"
 RUN_PID=""
+RUN_PGID=""
 RUN_RC=0
 PASS=0
 FAIL=0
 FAILED=()
+SETSID_BIN=$(command -v setsid || true)
+
+# True when PID is one of this suite's fake nvidia-smi processes: checked on
+# argv[1], so a shell whose *command line* merely mentions the path never
+# matches. Killing is limited to those, never to another worktree's processes.
+is_our_fake_pid() { # pid
+  local pid="$1" script=""
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  script=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n '2p')
+  [ "$script" = "$FAKE" ]
+}
+
+# Tear down whatever the previous case left behind: the daemon's process group
+# (it runs under setsid) and, as a fallback, the stream child recorded by the
+# fake. Called after the case's assertions, so a test can still prove that the
+# daemon itself killed its child.
+reap_case_processes() {
+  local pid="" members=""
+  if [ -n "${RUN_PGID:-}" ]; then
+    # Only a group that still holds one of *our* processes is killed: a recycled
+    # process group id must never hit another worktree's daemon.
+    if command -v pgrep >/dev/null 2>&1; then
+      members=$(pgrep -g "$RUN_PGID" -f -- "$FAKE" 2>/dev/null || true)
+      if [ -z "$members" ]; then
+        members=$(pgrep -g "$RUN_PGID" -f -- "${SCRIPT_UNDER_TEST:-$SCRIPT}" 2>/dev/null || true)
+      fi
+      if [ -n "$members" ]; then
+        kill -KILL -- "-$RUN_PGID" 2>/dev/null || true
+      fi
+    else
+      kill -KILL -- "-$RUN_PGID" 2>/dev/null || true
+    fi
+    RUN_PGID=""
+  fi
+  if [ -n "${RUN_PID:-}" ]; then
+    if [ -r "/proc/$RUN_PID/cmdline" ] \
+       && tr '\0' ' ' < "/proc/$RUN_PID/cmdline" 2>/dev/null \
+          | grep -qF -- "${SCRIPT_UNDER_TEST:-$SCRIPT}"; then
+      kill -KILL "$RUN_PID" 2>/dev/null || true
+    fi
+    RUN_PID=""
+  fi
+  if [ -n "${STATE:-}" ] && [ -f "$STATE/stream.pid" ]; then
+    read -r pid < "$STATE/stream.pid" || pid=""
+    if [ -n "$pid" ] && is_our_fake_pid "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+}
 
 suite_cleanup() {
-  if [ -n "$RUN_PID" ]; then kill -KILL "$RUN_PID" 2>/dev/null; fi
+  reap_case_processes
   # NIDC_KEEP=1 keeps the case directories for debugging a failure.
   if [ "${NIDC_KEEP:-0}" = "1" ]; then
     printf 'kept: %s\n' "$WORK"
@@ -79,6 +129,7 @@ assert_no_gpu_calls() { # name
 }
 
 new_case() { # name
+  reap_case_processes
   CASE_DIR="$WORK/$1"
   STATE="$CASE_DIR/state"
   OUT="$CASE_DIR/out.log"
@@ -97,26 +148,66 @@ run_daemon() { # [NAME=VALUE ...]
   RUN_RC=$rc
 }
 
-# Background run, used when the case has to send SIGTERM.
+# Background run, used when the case has to send SIGTERM. The daemon gets its
+# own process group (setsid) so the suite can reap it together with its
+# utilization-stream child instead of leaking that child into the user session.
 start_daemon() { # [NAME=VALUE ...]
   local under_test="${SCRIPT_UNDER_TEST:-$SCRIPT}"
-  env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
-    "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" &
-  RUN_PID=$!
+  RUN_PID=""
+  RUN_PGID=""
+  if [ -n "$SETSID_BIN" ]; then
+    env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
+      "$SETSID_BIN" "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" &
+    RUN_PID=$!
+    # setsid() and exec in one step: the daemon is a session leader, so its PID
+    # is also the process group to reap.
+    RUN_PGID=$RUN_PID
+  else
+    env NVSMI="$FAKE" FAKE_STATE="$STATE" "$@" \
+      "$BASH_BIN" "$under_test" >>"$OUT" 2>>"$ERR" &
+    RUN_PID=$!
+  fi
+}
+
+# Background watchdog for one daemon: if the daemon has not exited after 10 s,
+# kill its whole process group. It only ever touches the PID/PGID it was started
+# with, it re-checks the command line (so a recycled PID is never killed), and
+# the flag file disarms it when the daemon exited on its own.
+watchdog_kill() { # daemon-pid pgid flag script
+  local i=0
+  while [ ! -e "$3" ] && [ "$i" -lt 100 ]; do
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  if [ -e "$3" ] || [ ! -r "/proc/$1/cmdline" ]; then return 0; fi
+  if ! tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$4"; then
+    return 0
+  fi
+  if [ -n "$2" ]; then
+    kill -KILL -- "-$2" 2>/dev/null || true
+  else
+    kill -KILL "$1" 2>/dev/null || true
+  fi
 }
 
 stop_daemon() { # seconds to run before SIGTERM
-  local watchdog rc=0
+  local watchdog rc=0 flag="$CASE_DIR/watchdog.disarm"
+  local target="${SCRIPT_UNDER_TEST:-$SCRIPT}"
   sleep "$1"
-  # A stuck read would hang the suite, so a watchdog SIGKILLs after 5 s.
-  ( sleep 5; kill -KILL "$RUN_PID" 2>/dev/null ) &
+  rm -f "$flag"
+  watchdog_kill "$RUN_PID" "$RUN_PGID" "$flag" "$target" &
   watchdog=$!
   kill -TERM "$RUN_PID" 2>/dev/null
   wait "$RUN_PID" || rc=$?
+  # Disarm before killing the watchdog: whether the TERM is delivered promptly
+  # or late, a surviving watchdog can no longer touch anything.
+  : > "$flag"
   kill -TERM "$watchdog" 2>/dev/null
   wait "$watchdog" 2>/dev/null
   RUN_RC=$rc
   RUN_PID=""
+  # RUN_PGID is kept: the next new_case reaps a stream child that the daemon
+  # failed to kill, after this case has had the chance to assert on it.
 }
 
 # PATH containing everything the daemon and the fake need, and nothing else. Used
@@ -132,6 +223,65 @@ make_shim() { # dir [extra symlink name:target ...]
   for pair in "$@"; do
     ln -sf "${pair#*:}" "$dir/${pair%%:*}"
   done
+}
+
+# Poll until $1 holds at least $3 lines matching $2, for at most $4 tenths of a
+# second. Used where a fixed sleep would have to guess how long a reconnect
+# takes (#19, #5).
+wait_for_count() { # file fixed-string expected tenths
+  local i=0
+  while [ "$i" -lt "$4" ]; do
+    if [ "$(grep_count "$1" "$2")" -ge "$3" ]; then return 0; fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+# The utilization stream child must not outlive the daemon (issue #7). The fake
+# records its own PID on every stream start. Polled, because after a SIGKILL the
+# child can only notice that its reader vanished on the next write.
+assert_stream_child_gone() { # name pidfile
+  local pid="" i=0
+  if [ -f "$2" ]; then read -r pid < "$2" || pid=""; fi
+  if [ -z "$pid" ]; then
+    fail "$1" "no stream pid was recorded in $2"
+    return
+  fi
+  while [ "$i" -lt 20 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then pass "$1"; return; fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  fail "$1" "the utilization stream child (pid $pid) is still alive"
+}
+
+# nvidia-smi stand-in that records every argument quoted, so one call with a
+# space-joined GPU list ([0 1]) can be told apart from two per-GPU calls
+# (issue #5). The real fake is exec'd afterwards, so behaviour is unchanged.
+make_argv_wrapper() { # directory -> path on stdout
+  local dir="$1" wrapper="$1/nvidia-smi-argv"
+  mkdir -p "$dir"
+  cat > "$wrapper" <<'WRAPPER'
+#!/usr/bin/env bash
+printf 'call' >> "$FAKE_ARGV_QUOTED"
+for a in "$@"; do printf ' [%s]' "$a" >> "$FAKE_ARGV_QUOTED"; done
+printf '\n' >> "$FAKE_ARGV_QUOTED"
+exec "$FAKE_REAL" "$@"
+WRAPPER
+  chmod +x "$wrapper"
+  printf '%s' "$wrapper"
+}
+
+# Copy of the daemon with a fast reconnect backoff, so the bounded-attempt path
+# of issue #7 can be reached inside the test budget.
+make_retry_copy() { # destination
+  sed -e 's/^RETRY_MIN_S=2$/RETRY_MIN_S=1/' -e 's/^RETRY_MAX_S=30$/RETRY_MAX_S=1/' \
+    "$SCRIPT" > "$1"
+  chmod +x "$1"
+  if ! grep -q '^RETRY_MIN_S=1$' "$1"; then
+    printf 'tests: could not build the fast-retry copy\n' >&2
+  fi
 }
 
 # Copy of the daemon with one line injected into the main loop, so the "a fatal
@@ -387,11 +537,8 @@ case_stream_without_stdbuf() {
     fail "the no-stdbuf shim must not contain stdbuf" "unexpected $shim/stdbuf"
     return
   fi
-  env NVSMI="$FAKE" FAKE_STATE="$STATE" PATH="$shim" \
-    IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 \
-    FAKE_STREAM_LINES=40 FAKE_STREAM_SLEEP=0.05 \
-    "$BASH_BIN" "$SCRIPT" >>"$OUT" 2>>"$ERR" &
-  RUN_PID=$!
+  start_daemon PATH="$shim" IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 \
+    FAKE_STREAM_LINES=40 FAKE_STREAM_SLEEP=0.05
   stop_daemon 1.2
   assert_rc "the daemon runs without stdbuf" 0 "$RUN_RC"
   assert_has "the utilization stream is read without stdbuf" "$OUT" 'msg="clamp verified"'
@@ -455,6 +602,127 @@ case_log_format() {
   assert_eq "log lines are ASCII only" 0 "$bad"
   bad=$(LC_ALL=C grep -c '[^ -~]' "$SCRIPT")
   assert_eq "the daemon source is ASCII only (English)" 0 "$bad"
+}
+
+# --- #5: a stop while blocked in read unlocks every GPU separately ----------
+case_sigterm_multigpu_unlock() {
+  local wrapper argvq
+  new_case sigterm-multigpu
+  wrapper=$(make_argv_wrapper "$CASE_DIR/bin")
+  argvq="$CASE_DIR/argv-quoted.log"
+  : > "$argvq"
+  # SAMPLE_MS/FAKE_STREAM_SLEEP keep the daemon blocked inside `read` when the
+  # signal arrives, which is the state in which a leaked empty IFS used to break
+  # word splitting of the GPU list.
+  start_daemon GPU=0,1 FAKE_GPUS='0 1' IDLE_SECONDS=30 SAMPLE_MS=5000 \
+    FAKE_STREAM_SLEEP=5 \
+    NVSMI="$wrapper" FAKE_REAL="$FAKE" FAKE_ARGV_QUOTED="$argvq"
+  stop_daemon 0.8
+  assert_rc "a multi-GPU stop exits 0" 0 "$RUN_RC"
+  assert_count "the startup and stop unlocks are one -rgc per GPU" "$argvq" '[-rgc]' 4
+  assert_count "gpu 0 is reset with its own -i argument" "$argvq" '[-i] [0] [-rgc]' 2
+  assert_count "gpu 1 is reset with its own -i argument" "$argvq" '[-i] [1] [-rgc]' 2
+  assert_lacks "no space-joined GPU list is passed to -i" "$argvq" '[-i] [0 1] [-rgc]'
+  assert_lacks "no comma-joined GPU list is passed to -i" "$argvq" '[-i] [0,1] [-rgc]'
+  assert_stream_child_gone "the stream child does not outlive a stop" "$STATE/stream.pid"
+}
+
+# --- #7: a stalled stream is detected, the child is killed, the unit fails ---
+case_stream_stale() {
+  new_case stream-stale
+  run_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 FAKE_STREAM_STALL_AFTER=2
+  assert_rc "a stalled utilization stream exits non-zero" 1 "$RUN_RC"
+  assert_has "the stall is reported as an error" "$OUT" 'level=error msg="utilization stream stale"'
+  assert_has "the stall reports the read timeout" "$OUT" 'timeout_s=5'
+  assert_has "the clamp is released before the restart" "$OUT" 'msg="unlocked" gpu=0 trigger=exit'
+  assert_has "the exit line keeps the failure" "$OUT" 'msg="exit" gpu=0 rc=1'
+  assert_stream_child_gone "the stalled nvidia-smi child is killed" "$STATE/stream.pid"
+}
+
+case_stream_reconnect_bounded() {
+  local copy="$WORK/bounded-retry"
+  new_case stream-bounded
+  make_retry_copy "$copy"
+  SCRIPT_UNDER_TEST="$copy" run_daemon IDLE_SECONDS=30 FAKE_STREAM_LINES=1 \
+    FAKE_STREAM_EXIT_RC=1 FAKE_STREAM_STDERR='video driver unavailable'
+  assert_rc "a stream that never returns exits non-zero" 1 "$RUN_RC"
+  assert_has "the exhausted reconnect budget is an error" "$OUT" \
+    'level=error msg="utilization stream unavailable"'
+  assert_has "the reconnect budget is reported" "$OUT" 'attempts=5'
+  assert_has "the stream loss is reported" "$OUT" 'msg="stream lost"'
+  assert_count "the budget failure exits exactly once" "$OUT" 'msg="exit"' 1
+  assert_has "the failure is reflected in the exit line" "$OUT" 'msg="exit" gpu=0 rc=1'
+}
+
+# A SIGKILL cannot be trapped, so the stream child has to notice that its stdout
+# reader is gone and exit by itself; nothing may be left polling the driver.
+case_sigkill_stream_child() {
+  local pidfile="$STATE/stream.pid"
+  new_case sigkill-child
+  start_daemon IDLE_SECONDS=30 SAMPLE_MS=50
+  if ! wait_for_count "$ARGV" '--loop-ms' 1 30; then
+    fail "the utilization stream is started" "no stream within 3 s"
+    stop_daemon 0.1
+    return
+  fi
+  kill -KILL "$RUN_PID" 2>/dev/null
+  wait "$RUN_PID" 2>/dev/null || true
+  RUN_PID=""
+  assert_stream_child_gone "the stream child exits after the daemon is SIGKILLed" "$pidfile"
+}
+
+# --- #8: unreadable utilization releases the clamp and never counts as idle --
+case_util_unavailable_releases() {
+  new_case util-unavailable
+  start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 FAKE_STREAM_UTILS='0 [N/A]'
+  stop_daemon 1.0
+  assert_has "the clamp is applied on the numeric sample" "$OUT" 'msg="clamp verified"'
+  assert_has "unreadable utilization is reported" "$OUT" 'level=warn msg="utilization unavailable"'
+  assert_count "unreadable utilization is logged once per streak" "$OUT" \
+    'msg="utilization unavailable"' 1
+  assert_has "the unreadable sample is kept in the log" "$OUT" 'raw="0, [N/A]"'
+  assert_has "the clamp is released while utilization is unreadable" "$OUT" \
+    'msg="unlocked" gpu=0 trigger=unavailable'
+  assert_rc "an unreadable sample is not a fatal error" 0 "$RUN_RC"
+}
+
+case_util_unavailable_not_idle() {
+  new_case util-unavailable-idle
+  start_daemon IDLE_SECONDS=1 SAMPLE_MS=50 SKIP_IF_LOW=1 FAKE_STREAM_UTILS='[N/A]'
+  stop_daemon 1.6
+  assert_has "unreadable utilization is reported" "$OUT" 'msg="utilization unavailable"'
+  assert_count "unreadable utilization never accumulates idle time" "$ARGV" ' -lgc ' 0
+}
+
+# --- #19: idle time is wall-clock time, not a count of CSV lines -------------
+case_idle_timer_wall_clock() {
+  new_case idle-wall-clock
+  # The stream delivers every 0.6 s while SAMPLE_MS claims 50 ms: a line counter
+  # would need 40 samples (24 s) to reach IDLE_SECONDS=2 and never clamp here.
+  start_daemon IDLE_SECONDS=2 SAMPLE_MS=50 SKIP_IF_LOW=1 FAKE_STREAM_SLEEP=0.6
+  sleep 1.2
+  assert_lacks "idle time is not inferred from the sample count" "$OUT" 'msg="clamp verified"'
+  stop_daemon 2.2
+  assert_has "the configured idle seconds are wall-clock seconds" "$OUT" 'msg="clamp verified"'
+}
+
+case_idle_timer_reconnect_gap() {
+  new_case idle-reconnect
+  start_daemon IDLE_SECONDS=1 SAMPLE_MS=50 SKIP_IF_LOW=1 \
+    FAKE_STREAM_LINES_ONCE=3 FAKE_STREAM_SLEEP=0.1
+  if ! wait_for_count "$ARGV" '--loop-ms' 2 50; then
+    fail "the utilization stream reconnects" "no second connection within 5 s"
+    stop_daemon 0.2
+    return
+  fi
+  # The 2 s reconnect gap has just ended. Without a reset of the per-GPU
+  # timestamp it would be counted as idle and the clamp would already be in
+  # flight; with the reset the timer starts again from zero.
+  sleep 0.6
+  assert_lacks "the blind reconnect gap is not counted as idle" "$OUT" 'msg="clamp verified"'
+  sleep 1.0
+  assert_has "the idle timer restarts after a reconnect" "$OUT" 'msg="clamp verified"'
+  stop_daemon 0.4
 }
 
 # --- #25: command-line handling -------------------------------------------
@@ -569,6 +837,14 @@ case_stop_is_success
 case_fatal_status_preserved
 case_stream_without_stdbuf
 case_stream_error_visible
+case_sigterm_multigpu_unlock
+case_stream_stale
+case_sigkill_stream_child
+case_stream_reconnect_bounded
+case_util_unavailable_releases
+case_util_unavailable_not_idle
+case_idle_timer_wall_clock
+case_idle_timer_reconnect_gap
 case_gpu_index_selected
 case_gpu_uuid_selected
 case_gpu_unknown
@@ -580,6 +856,22 @@ case_cli_dry_run_invalid
 case_cli_unknown_argument
 case_cli_positional_argument
 case_cli_no_args_starts
+
+# --- no leaked stream children --------------------------------------------
+# The daemon kills its utilization-stream child on the way out (issue #7), and
+# the suite reaps the daemon's process group. This check proves it: a leftover
+# fake would keep polling for the rest of the session.
+reap_case_processes
+if command -v pgrep >/dev/null 2>&1; then
+  leftover=$(pgrep -f -- "$FAKE" 2>/dev/null || true)
+  if [ -z "$leftover" ]; then
+    pass "the suite leaves no fake nvidia-smi process behind"
+  else
+    fail "the suite leaves no fake nvidia-smi process behind" \
+      "still running: $(printf '%s' "$leftover" | tr '\n' ' ')"
+    for p in $leftover; do kill -KILL "$p" 2>/dev/null || true; done
+  fi
+fi
 
 if [ "$FAIL" -eq 0 ]; then
   printf '\nsummary: %d checks passed, 0 failed\n' "$PASS"

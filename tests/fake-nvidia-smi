@@ -23,9 +23,17 @@
 #   FAKE_RGC_STDERR=""        stderr printed by -rgc
 #   FAKE_STREAM_UTILS="0"     utilization of each stream tick; last value repeats
 #   FAKE_STREAM_LINES=0       0 = stream until killed, N = N lines then exit
+#   FAKE_STREAM_LINES_ONCE=0  N: only the first connection stops after N lines,
+#                             later connections stream until killed
 #   FAKE_STREAM_SLEEP=0.05    seconds between stream lines
 #   FAKE_STREAM_EXIT_RC=0     stream exit status after FAKE_STREAM_LINES
 #   FAKE_STREAM_STDERR=""     stderr printed once when the stream starts
+#   FAKE_STREAM_STALL_AFTER=0 N: after N ticks stop printing but stay alive
+#                             (exec sleep 30, so the PID stays the same and
+#                             killing it leaves no child behind); 0 = never
+#   $FAKE_STATE/stream.pid    written on every stream start with the PID of the
+#                             stream child, so a test can prove the daemon
+#                             reaped it
 set -uo pipefail
 
 STATE="${FAKE_STATE:?FAKE_STATE must be set to a writable directory}"
@@ -64,7 +72,14 @@ uuid_of() { printf 'GPU-01234567-89ab-cdef-0123-456789abcd%02x' "$1"; }
 
 stream() { # idx arg (comma separated), honouring -i like the real tool
   local -a gpus=() utils=() req=()
-  local g="" i=0 last=0 util=""
+  local g="" i=0 last=0 util="" eof_after="${FAKE_STREAM_LINES:-0}"
+  if [ "${FAKE_STREAM_LINES_ONCE:-0}" -gt 0 ]; then
+    if [ "$(bump stream.connections)" -eq 1 ]; then
+      eof_after="${FAKE_STREAM_LINES_ONCE}"
+    else
+      eof_after=0
+    fi
+  fi
   IFS=' ,' read -r -a gpus <<< "${FAKE_GPUS:-0}"
   IFS=' ,' read -r -a utils <<< "${FAKE_STREAM_UTILS:-0}"
   last=$(( ${#utils[@]} - 1 ))
@@ -80,12 +95,20 @@ stream() { # idx arg (comma separated), honouring -i like the real tool
     printf '%s\n' "$FAKE_STREAM_STDERR" >&2
   fi
   while :; do
-    if [ "${FAKE_STREAM_LINES:-0}" -gt 0 ] && [ "$i" -ge "${FAKE_STREAM_LINES}" ]; then
+    if [ "$eof_after" -gt 0 ] && [ "$i" -ge "$eof_after" ]; then
       exit "${FAKE_STREAM_EXIT_RC:-0}"
+    fi
+    if [ "${FAKE_STREAM_STALL_AFTER:-0}" -gt 0 ] \
+       && [ "$i" -ge "${FAKE_STREAM_STALL_AFTER}" ]; then
+      # A stalled nvidia-smi: no more output, process still alive, no child.
+      exec sleep 30
     fi
     if [ "$i" -le "$last" ]; then util="${utils[$i]}"; else util="${utils[$last]}"; fi
     for g in "${gpus[@]}"; do
-      printf '%s, %s\n' "$g" "$util"
+      # If the reader is gone the write fails (EPIPE). SIGPIPE may be ignored in
+      # a sandbox, so exiting on the failed write is what keeps a leaked stream
+      # child from spinning forever after the daemon is gone.
+      printf '%s, %s\n' "$g" "$util" || exit 0
     done
     sleep "$START_SLEEP"
     i=$(( i + 1 ))
@@ -135,6 +158,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$want_stream" -eq 1 ]; then
+  # The PID of this process is the PID the daemon has to kill when the stream
+  # stalls (issue #7); tests assert it is gone after the daemon exits.
+  printf '%s\n' "$$" > "$STATE/stream.pid" 2>/dev/null || true
   stream "$idx"
   exit 0
 fi
