@@ -201,7 +201,14 @@ sudo systemctl enable --now nvidia-idle-clock@1.service   # GPU 1
 |---|---|
 | `-h`, `--help` | print usage and exit |
 | `-n`, `--dry-run` | print every action without changing anything |
-| `--keep-clocks` | remove the units and files but leave the clock locks in place |
+| `--keep-clocks` | remove the units and files but keep the clock limit; the daemon's stop path and `ExecStopPost --unlock` skip `-rgc` (see below) |
+
+With `--keep-clocks`, `uninstall.sh` writes `${STATE_DIR:-/run/nvidia-idle-clock}/keep-clocks`
+before it stops the units. The daemon's stop path and the unit's `ExecStopPost --unlock` respect
+that marker: they skip `-rgc` and leave the `gpu<N>.locked` markers in place, and the stop still
+counts as successful. The clamp therefore survives the uninstall until reboot or an explicit
+`nvidia-smi -rgc`; a failed uninstall removes the keep-clocks marker. `uninstall.sh`
+honours `STATE_DIR` as well, so a non-default state directory behaves the same way.
 
 Both validate before writing. The `install.sh` preflight checks the required commands
 (`nvidia-smi`, `systemctl`, `install`, `sha256sum`, `stat`, `cp`, `cmp`, `date`), that systemd is
@@ -220,7 +227,7 @@ backup (`<path>.bak.<YYYYMMDDTHHMMSS>`).
   refused without `--force` (nothing is written).
 - `uninstall.sh` leaves the files in place when a unit cannot be stopped (a running daemon must
   not be left without its unit). After removal it verifies that the files are gone and checks the
-  `-rgc` result.
+  `-rgc` result (`--keep-clocks` skips the release).
 
 ## Daemon command line
 
@@ -242,8 +249,10 @@ arguments print `level=error msg="unknown argument"` plus the usage line on stde
 
 `--unlock` is the recovery path for a clamp that outlived its daemon (SIGKILL, OOM,
 `TimeoutStopSec`); the unit runs it as `ExecStopPost`. It runs `-rgc` only for target GPUs that
-carry `$STATE_DIR/gpu<N>.locked` and removes each marker it released. Nothing to do is exit 0; a
-failed `-rgc` is exit 1. A GPU whose `flock` is held by a live instance is skipped with
+carry `$STATE_DIR/gpu<N>.locked` and removes each marker it released. When
+`${STATE_DIR}/keep-clocks` exists (the uninstaller's `--keep-clocks`), it releases nothing, leaves
+the markers in place and still exits 0. Nothing to do is exit 0; a failed `-rgc` is exit 1.
+A GPU whose `flock` is held by a live instance is skipped with
 `level=warn msg="gpu managed by another instance"`. It does not run the `clocks.max.gr` check
 because it only releases.
 
@@ -472,11 +481,12 @@ A clamp outlives the process that made it, so the daemon records it outside the 
 
 - `STATE_DIR` (default `/run/nvidia-idle-clock`) holds one set of files per GPU and is created by
   the daemon with mode 0700.
-  - `gpu<N>.locked` — marker written after a verified clamp, removed on release.
+  - `gpu<N>.locked` — recovery marker written before the clamp request, removed on release. It is
+    also kept when the clamp could not be verified, so the GPU stays a release target.
   - `gpu<N>.lock` — `flock` target used for the per-GPU exclusion.
-- The marker is the only record that "this process clamped this GPU". It survives a crash, so the
-  next start and `--unlock` release exactly the marked GPUs. A GPU with no marker may belong to
-  another tool, so it is never touched.
+- The marker is the only record that this process has (or may have) clamped this GPU. It survives a
+  crash, so the next start and `--unlock` release exactly the marked GPUs. A GPU with no marker may
+  belong to another tool, so it is never touched.
 - If two instances target the same GPU, the second one cannot take the `flock` and exits 3 with
   `msg="gpu already managed"`. The unit sets `RestartPreventExitStatus=3`, so it does not restart.
 - On stop the unit runs `ExecStopPost=-/usr/local/sbin/nvidia-idle-clock --unlock`. Even when the
@@ -492,11 +502,17 @@ A clamp outlives the process that made it, so the daemon records it outside the 
 
 - Polls target GPU utilization every `SAMPLE_MS` (each instance independent)
 - `IDLE_SECONDS` idle → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
+- A clamp whose read-back could not be verified (`clocks.gr` empty, `[N/A]` or above the cap) is kept
+  as a release target too: it is released on activity, on an unreadable sample and on exit
+  (`msg="clamp unverified" ... action="release-retry"`)
 - Utilization > `UTIL_THRESHOLD` → release with `-rgc` (immediate even during `COOLDOWN_SECONDS`)
 - With `SKIP_IF_LOW=1`, already-low GPUs are left alone (nothing to do when VRAM is empty)
 - If the utilization stream delivers nothing for `max(5s, 5×SAMPLE_MS)`, the `nvidia-smi` child is
   stopped and the daemon exits 1 (`msg="utilization stream stale"`); systemd restarts it through
   `Restart=on-failure`
+- A missing `/dev/nvidiactl` at boot is an `ExecStartPre` failure, not a start condition:
+  `Restart=on-failure` retries it under the 30 restarts / 600s budget (~5 min), so a slow driver no
+  longer leaves the service silently skipped
 - When the stream ends, reconnect with exponential backoff (2→30s) and report the first stderr
   line in `msg="stream lost"`; 5 failed reconnects inside 60s log
   `msg="utilization stream unavailable"` and exit 1
@@ -506,6 +522,8 @@ A clamp outlives the process that made it, so the daemon records it outside the 
   which stops short clamp/release flapping; `0` disables it
 - At startup only GPUs carrying a marker left by the previous clamp are released. A GPU without a
   marker is never touched, so a clock lock another tool set is not reset by a plain start
+- A failed release of a stale marker at startup is not forgotten: the GPU stays a release target and
+  is retried when it becomes busy (`msg="startup unlock failed" ... action="retry-on-activity"`)
 - On stop only the GPUs this instance clamped are released. When the EXIT trap cannot run
   (SIGKILL, OOM, `TimeoutStopSec`), the unit's `ExecStopPost` runs `--unlock` and releases the
   marked GPUs
@@ -537,13 +555,16 @@ A clamp outlives the process that made it, so the daemon records it outside the 
 
 ## Troubleshooting
 
-Find the section from the symptom. No new facts are added here.
+Find the section from the symptom.
 
 - Not clamping → the applicability rules in [Overview](#overview), and `IDLE_SECONDS` / `SKIP_IF_LOW` in [Configuration](#configuration)
 - Not released / clamp left behind → `--unlock` and `ExecStopPost` in [State directory and exclusion](#state-directory-and-exclusion)
 - exit 3 with `gpu already managed` → [Per-GPU assignment](#per-gpu-assignment)
 - Reading the log / filtering `level=` → [Sample log](#sample-log)
 - Exit status meanings → [Daemon command line](#daemon-command-line)
+- Unit is `failed` after boot → check `journalctl -u nvidia-idle-clock@0` for the `/dev/nvidiactl`
+  `ExecStartPre` check; once the driver is up, `systemctl reset-failed nvidia-idle-clock@0.service`
+  then `systemctl start nvidia-idle-clock@0.service`
 - The danger on a shared GPU → [Shared GPUs](#shared-gpus)
 
 ## Shared GPUs

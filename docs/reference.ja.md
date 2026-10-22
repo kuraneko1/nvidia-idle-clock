@@ -196,7 +196,14 @@ sudo systemctl enable --now nvidia-idle-clock@1.service   # GPU 1
 |---|---|
 | `-h`, `--help` | 使い方を表示して終了 |
 | `-n`, `--dry-run` | 実行内容を表示するだけで何も変更しない |
-| `--keep-clocks` | クロックロックを解除せず、ユニットとファイルだけ削除する |
+| `--keep-clocks` | ユニットとファイルだけ削除し、クロック上限は保持する (デーモンの停止処理と `ExecStopPost --unlock` は `-rgc` を実行しない。下記参照) |
+
+`--keep-clocks` を指定すると、`uninstall.sh` はユニットを止める前に
+`${STATE_DIR:-/run/nvidia-idle-clock}/keep-clocks` を書く。デーモンの停止処理とユニットの
+`ExecStopPost --unlock` はこのマーカーを尊重して `-rgc` を実行せず、`gpu<N>.locked` マーカーも
+残したまま正常停止として扱う。そのためクランプはアンインストール後も再起動、または明示的な
+`nvidia-smi -rgc` まで残る。アンインストールに失敗した場合は keep-clocks マーカーを削除する。
+`uninstall.sh` は `STATE_DIR` も尊重するので、既定以外の状態ディレクトリでも同じように動く。
 
 どちらも書き込む前に対象を検証する。`install.sh` の preflight は必須コマンド
 (`nvidia-smi`, `systemctl`, `install`, `sha256sum`, `stat`, `cp`, `cmp`, `date`) と
@@ -214,7 +221,8 @@ systemd の動作、ソースファイルの存在を確認し、引数エラー
   なく、共有グループ経由の group-writable でもないこと。満たさない場合は `--force` なしで
   拒否する (何も書き込まない)。
 - `uninstall.sh` はユニットを止められなかった時点でファイルを残す (動いているデーモンを
-  ユニットなしにしない)。削除後にファイルが消えたことを検証し、`-rgc` の成否も確認する。
+  ユニットなしにしない)。削除後にファイルが消えたことを検証し、`-rgc` の成否も確認する
+  (`--keep-clocks` のときは解除しない)。
 
 ## デーモンのコマンドライン
 
@@ -236,7 +244,9 @@ usage: nvidia-idle-clock [-h|--help] [-V|--version] [-n|--dry-run] [-u|--unlock]
 
 `--unlock` は、SIGKILL・OOM・`TimeoutStopSec` 超過などでデーモン自身が解除できなかった
 クランプの復旧用で、ユニットの `ExecStopPost` がこれを実行する。対象 GPU のうち
-`$STATE_DIR/gpu<N>.locked` があるものだけを `-rgc` してマーカーを消す。何も無ければ exit 0、
+`$STATE_DIR/gpu<N>.locked` があるものだけを `-rgc` してマーカーを消す。
+`${STATE_DIR}/keep-clocks` がある場合 (アンインストーラの `--keep-clocks`) は、何も解除せず
+マーカーを残したまま終了する (exit 0)。何も無ければ exit 0、
 `-rgc` に失敗した GPU があれば exit 1。生きているインスタンスが `flock` を持っている GPU は
 `level=warn msg="gpu managed by another instance"` を出してスキップする。解除だけなので
 `clocks.max.gr` の検証は行わない。
@@ -462,11 +472,12 @@ level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nv
 
 - `STATE_DIR` (既定 `/run/nvidia-idle-clock`) に GPU ごとのファイルを置く。デーモンが
   mode 0700 で作成する。
-  - `gpu<N>.locked` — クランプを検証したあとに作るマーカー。解除で消える。
+  - `gpu<N>.locked` — クランプ要求の前に書く復旧用マーカー。解除で消える。適用を確認できなかった
+    場合も解除対象として残す。
   - `gpu<N>.lock` — `flock` の対象。排他用。
-- マーカーは「このプロセスがこの GPU をクランプした」という唯一の記録。プロセスが落ちても
-  残るので、次回起動時と `--unlock` はマーカーのある GPU だけを解除できる。逆に、マーカーの
-  無い GPU は他ツールのロックかもしれないので触らない。
+- マーカーは「このプロセスがこの GPU をクランプした (可能性がある)」という唯一の記録。
+  プロセスが落ちても残るので、次回起動時と `--unlock` はマーカーのある GPU だけを解除できる。
+  逆に、マーカーの無い GPU は他ツールのロックかもしれないので触らない。
 - 同じ GPU を 2 つのインスタンスが指すと、2 つ目は `flock` を取れず
   `msg="gpu already managed"` で exit 3。ユニットは `RestartPreventExitStatus=3` なので
   再起動しない。
@@ -484,10 +495,16 @@ level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nv
 
 - 対象 GPU の利用率を `SAMPLE_MS` 間隔で監視 (インスタンスごとに独立)
 - `IDLE_SECONDS` 無負荷 → `nvidia-smi -i N -lgc MIN_CLK,IDLE_CAP`
+- クランプ後の読み戻しで `clocks.gr` が空・`[N/A]`・上限超えになり適用を確認できなかった場合は、
+  ロックされている可能性があるものとして解除対象に残す。負荷検出時・利用率が読めないサンプル・
+  終了時に解除し、ジャーナルには `msg="clamp unverified" ... action="release-retry"` を出す
 - 利用率 > `UTIL_THRESHOLD` → `-rgc` で解除 (`COOLDOWN_SECONDS` 中でも解除は即時)
 - `SKIP_IF_LOW=1` のとき既に低クロックなら何もしない (VRAM が空なら不要なため)
 - 利用率ストリームが `max(5秒, 5×SAMPLE_MS)` のあいだ途切れたら、その `nvidia-smi` を停止して
   exit 1 で終了する (`msg="utilization stream stale"`)。systemd は `Restart=on-failure` で再起動する
+- 起動時に `/dev/nvidiactl` が無い場合は起動条件でスキップせず、`ExecStartPre` の失敗として
+  `Restart=on-failure` が 30 回 / 600 秒の予算 (約 5 分) で再試行する。ドライバの準備が遅れても
+  サービスが黙ってスキップされたままにならない
 - ストリームが終了した場合は 2 秒後から指数バックオフ (2→30 秒) で再接続し、最初の stderr 行を
   `msg="stream lost"` に載せる。60 秒以内に 5 回失敗したら
   `msg="utilization stream unavailable"` で exit 1
@@ -497,6 +514,8 @@ level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nv
   繰り返しを防ぐためで、`0` で無効化できる
 - 起動時は、前回のクランプが残したマーカーがある GPU だけを `-rgc` で解除する。マーカーの
   無い GPU には触れないので、他ツールが設定したクロックロックを起動だけで消すことはない
+- 起動時に残存マーカーの解除に失敗した場合も、その GPU を解除対象に残してビジーになった時点で
+  再試行する (ジャーナルには `msg="startup unlock failed" ... action="retry-on-activity"` を出す)
 - 停止時は自分がクランプした GPU だけを `-rgc` で解除する。SIGKILL・OOM・`TimeoutStopSec`
   超過で trap が走らなくても、ユニットの `ExecStopPost` が `--unlock` を実行し、マーカーの
   ある GPU を解除する
@@ -527,13 +546,17 @@ level=error msg="gpu already managed" gpu=1 hint="another instance holds /run/nv
 
 ## トラブルシュート
 
-症状から該当節を引く。新しい事実は足していない。
+症状から該当節を引く。
 
 - クランプされない → [概要](#概要) の適用条件、[設定](#設定) の `IDLE_SECONDS` / `SKIP_IF_LOW`
 - 解除されない・クランプが残った → [状態ディレクトリと排他](#状態ディレクトリと排他) の `--unlock` と `ExecStopPost`
 - `gpu already managed` で exit 3 → [GPU ごとの割り当て](#gpu-ごとの割り当て)
 - ログの読み方・`level=` の絞り込み → [サンプルログ](#サンプルログ)
 - 終了コードの意味 → [デーモンのコマンドライン](#デーモンのコマンドライン)
+- ブート後にユニットが `failed` → `journalctl -u nvidia-idle-clock@0` で `/dev/nvidiactl` の
+  `ExecStartPre` チェックを確認する。ドライバが起動したら
+  `systemctl reset-failed nvidia-idle-clock@0.service` のあと
+  `systemctl start nvidia-idle-clock@0.service` を実行する
 - 共有 GPU での危険 → [共有 GPU](#共有-gpu)
 
 ## 共有 GPU
