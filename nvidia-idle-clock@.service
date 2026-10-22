@@ -1,26 +1,94 @@
 [Unit]
 Description=Idle clock clamp for NVIDIA GPU %i (idle power saving)
-StartLimitIntervalSec=60
-StartLimitBurst=5
+Documentation=https://github.com/kuraneko1/nvidia-idle-clock
+Documentation=https://github.com/kuraneko1/nvidia-idle-clock/blob/main/README.md
+
+# Start only once the NVIDIA driver has created its control node. Without this
+# a boot can reach the unit before the driver is ready and every attempt fails
+# inside the script with "no valid GPU" (#11).
+# An unmet condition is a *skip*, not a failure, so if the feature seems to be
+# missing after a boot check:
+#   systemctl show nvidia-idle-clock@0.service -p ConditionResult
+ConditionPathExists=/dev/nvidiactl
+
+# Lower parallelism with the driver stack. Both units are optional: where they
+# do not exist the ordering is simply ignored and nothing extra is pulled in.
+# systemd-udev-settle.service is deliberately not used - it is deprecated and
+# delays every boot.
+After=nvidia-persistenced.service
+After=dev-nvidiactl.device
+
+# Restart budget (#11). 30 attempts at RestartSec=10s span roughly 300s, so a
+# driver that needs tens of seconds is no longer left as a permanently failed
+# unit. The interval is deliberately 600s and not 300s: systemd only trips the
+# limit when restarts come faster than StartLimitIntervalSec / StartLimitBurst
+# (20s here), and with 300s/30 a restart every 10s slides through the sliding
+# window indefinitely - a permanent failure would never reach "failed".
+# Measured with the values below: "failed" after 30 restarts at t=300s.
+# The previous 5 attempts / 60s / 5s gave up after ~25s and left one boot-time
+# miss as a failed unit for the rest of that boot.
+StartLimitIntervalSec=600
+StartLimitBurst=30
 
 [Service]
 Type=simple
-# インスタンス名がそのまま対象 GPU (nvidia-smi index) になる。
+# The instance name is used directly as the target GPU (nvidia-smi index):
 #   nvidia-idle-clock@0.service  -> GPU 0
 #   nvidia-idle-clock@1.service  -> GPU 1
-# 任意の GPU への割り当てや GPU ごとの個別設定は drop-in で上書きする:
+# Assign a different GPU, or override settings for one GPU, with a drop-in:
 #   sudo systemctl edit nvidia-idle-clock@0.service
 #     [Service]
-#     Environment=GPU=2            # 別の GPU に割り当てる
-#     Environment=IDLE_CAP=555     # この GPU だけ上限を緩める
+#     Environment=GPU=2            # serve another GPU
+#     Environment=IDLE_CAP=555     # relax the cap for this GPU only
 #     Environment=IDLE_SECONDS=120
 Environment=GPU=%i
 Environment=IDLE_CAP=135
 Environment=IDLE_SECONDS=30
+
+# Reject a non-numeric instance name before the daemon starts (#30). The
+# instance is used verbatim as the GPU index, so anything else can only fail
+# later inside the script - after a restart loop that ends in start-limit, with
+# "Start request repeated too quickly" as the only hint. systemd escapes unit
+# names, so %i cannot break out of the quotes below.
+# A non-numeric instance that gets its GPU from a drop-in (Environment=GPU=...)
+# is now rejected too; reset the list in the same drop-in with a bare
+# "ExecStartPre=" if you rely on that.
+ExecStartPre=/bin/sh -c 'case "%i" in ""|*[!0-9]*) echo "nvidia-idle-clock: invalid GPU instance %i" >&2; exit 1;; esac'
+
 ExecStart=/usr/local/sbin/nvidia-idle-clock
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 TimeoutStopSec=20s
+
+# Sandboxing (#10). The unit runs bash + nvidia-smi and logs to the journal, so
+# it needs no writable file system, no /home, no network and no kernel
+# interfaces. Device access is untouched: PrivateDevices= and DevicePolicy= are
+# deliberately not set, /dev/nvidia* stays reachable exactly as before.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+RemoveIPC=yes
+UMask=0077
+
+# CapabilityBoundingSet= and SystemCallFilter= are intentionally left at the
+# systemd defaults. nvidia-smi -lgc/-rgc goes through NVML ioctls on
+# /dev/nvidiactl and the exact capability set it needs (CAP_SYS_ADMIN and
+# possibly more) has not been validated on hardware. A wrong value here turns
+# the daemon into a restart loop on the owner's machine, which is worse than
+# the hardening it would buy. Validate -lgc/-rgc on a test GPU before adding
+# either, then tighten the bounding set first.
 
 [Install]
 WantedBy=multi-user.target
