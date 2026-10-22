@@ -283,6 +283,44 @@ WRAPPER
   printf '%s' "$wrapper"
 }
 
+# nvidia-smi wrapper for failures the fake cannot express. Everything it does
+# not intercept is delegated to the fake through FAKE_REAL. It records every
+# call it receives in $FAKE_STATE/fault-argv.log (the fake only sees the calls
+# that reach it, i.e. not the intercepted failures).
+#   FAKE_CLOCK_UNREADABLE=1  clocks.gr answers [N/A] instead of a number
+#   FAKE_RGC_FAIL_ONCE=1     the first -rgc fails, later ones reach the fake
+# Used by #44 (a clamp whose read-back is inconclusive) and #45 (a startup
+# release that fails exactly once).
+make_fault_wrapper() { # directory -> path on stdout
+  local dir="$1" wrapper="$1/nvidia-smi-fault"
+  mkdir -p "$dir"
+  cat > "$wrapper" <<'WRAPPER'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(date +%s)" "$*" >> "$FAKE_STATE/fault-argv.log" 2>/dev/null || true
+for a in "$@"; do
+  case "$a" in
+    --query-gpu=clocks.gr)
+      if [ "${FAKE_CLOCK_UNREADABLE:-0}" = "1" ]; then
+        printf '[N/A]\n'
+        exit 0
+      fi
+      ;;
+    -rgc)
+      if [ "${FAKE_RGC_FAIL_ONCE:-0}" = "1" ] \
+         && [ ! -e "$FAKE_STATE/rgc-failed-once" ]; then
+        : > "$FAKE_STATE/rgc-failed-once"
+        printf 'temporary reset failure\n' >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+exec "$FAKE_REAL" "$@"
+WRAPPER
+  chmod +x "$wrapper"
+  printf '%s' "$wrapper"
+}
+
 # Copy of the daemon with a fast reconnect backoff, so the bounded-attempt path
 # of issue #7 can be reached inside the test budget.
 make_retry_copy() { # destination
@@ -438,9 +476,10 @@ case_clamp_not_applied() {
     FAKE_LGC_APPLIES=0 \
     FAKE_LGC_STDERR='Specified clock combination is not supported; treating as warning and moving on.'
   stop_daemon 1.2
-  assert_has "an ineffective clamp is reported as an error" "$OUT" 'level=error msg="clamp not applied"'
+  assert_has "an ineffective clamp is reported as an error" "$OUT" 'level=error msg="clamp unverified"'
   assert_has "the ineffective clamp reports the observed clock" "$OUT" 'observed_mhz=1260'
   assert_has "the ineffective clamp keeps nvidia-smi stderr" "$OUT" "treating as warning and moving on."
+  assert_has "the ineffective clamp stays a release target" "$OUT" 'action="release-retry"'
   assert_lacks "an ineffective clamp is never called verified" "$OUT" 'msg="clamp verified"'
   assert_count "a rejected clamp is not retried on every sample" "$ARGV" ' -lgc ' 1
 }
@@ -452,11 +491,12 @@ case_clamp_failed_backoff_short() {
     FAKE_LGC_RC=4 \
     FAKE_LGC_STDERR='The current user does not have permission to change clocks'
   stop_daemon 1.2
-  assert_has "a rejected clamp is logged" "$OUT" 'level=error msg="clamp failed"'
+  assert_has "a rejected clamp is logged" "$OUT" 'level=error msg="clamp unverified"'
   assert_has "the clamp failure carries the return code" "$OUT" 'rc=4'
   assert_has "the clamp failure carries nvidia-smi stderr" "$OUT" 'does not have permission'
   assert_has "the clamp failure announces the backoff" "$OUT" 'retry_s=5'
-  assert_count "a failing clamp logs once, not per sample" "$OUT" 'msg="clamp failed"' 1
+  assert_has "the rejected clamp stays a release target" "$OUT" 'action="release-retry"'
+  assert_count "a failing clamp logs once, not per sample" "$OUT" 'msg="clamp unverified"' 1
   assert_count "a failing clamp does not fork nvidia-smi per sample" "$ARGV" ' -lgc ' 1
 }
 
@@ -474,7 +514,7 @@ case_clamp_failed_backoff_grows() {
   if [ "${#stamps[@]}" -eq 2 ]; then
     assert_ge "the retry waits for the 5 s backoff" 4 "$(( stamps[1] - stamps[0] ))"
   fi
-  assert_count "the failure is logged only on the state change" "$OUT" 'msg="clamp failed"' 1
+  assert_count "the failure is logged only on the state change" "$OUT" 'msg="clamp unverified"' 1
 }
 
 case_clamp_reassert() {
@@ -489,6 +529,76 @@ case_clamp_reassert() {
   assert_has "the failed re-assert reports its stderr" "$OUT" 'Unable to set clocks'
   assert_count "a repeated re-assert failure is logged once" "$OUT" 'msg="clamp reassert failed"' 1
   assert_lacks "a failed re-assert is not reported as a new clamp" "$OUT" 'trigger=reassert observed_mhz=135'
+}
+
+# --- #44: a clamp that cannot be verified keeps its recovery target ---------
+case_clamp_unverified_readback() {
+  local wrapper
+  new_case clamp-unverified-readback
+  wrapper=$(make_fault_wrapper "$CASE_DIR/bin")
+  # -lgc succeeds and the fake moves the clock to 135, but the read-back answers
+  # [N/A] forever: the daemon cannot prove the clamp, which is exactly the
+  # "may be locked" state that used to drop its recovery target.
+  start_daemon NVSMI="$wrapper" FAKE_REAL="$FAKE" \
+    FAKE_CLOCK_UNREADABLE=1 FAKE_RGC_FAIL_ONCE=1 \
+    IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 \
+    FAKE_STREAM_UTILS='0 0 0 90 0' FAKE_STREAM_SLEEP=0.1
+  if ! wait_for_count "$OUT" 'msg="clamp unverified"' 1 60; then
+    fail "the unverifiable clamp is reported" "no 'clamp unverified' within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_has "the unverified clamp is an error with an action" "$OUT" \
+    'level=error msg="clamp unverified" gpu=0 trigger=idle rc=0'
+  assert_has "the unverified read-back is reported" "$OUT" 'observed_mhz=?'
+  assert_has "the unverified clamp says it will release" "$OUT" 'action="release-retry"'
+  assert_lacks "an unverified clamp is never called verified" "$OUT" 'msg="clamp verified"'
+  # The intent marker is written before -lgc, so it is already there while the
+  # result is unknown. The first -rgc (the activity sample) fails on purpose and
+  # leaves it in place, which proves the failed attempt did not drop it.
+  assert_file_exists "the recovery marker exists while the clamp is unverified" \
+    "$DSTATE/gpu0.locked"
+  if ! wait_for_count "$OUT" 'msg="unlock failed"' 1 60; then
+    fail "the unknown clamp is released on activity" "no unlock attempt within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_has "the activity release targets the unverified GPU" "$OUT" \
+    'msg="unlock failed" gpu=0 trigger=util'
+  assert_file_exists "a failed activity release keeps the marker" "$DSTATE/gpu0.locked"
+  stop_daemon 0.3
+  assert_rc "the stop retries the release and succeeds" 0 "$RUN_RC"
+  assert_has "the exit path releases the unverified clamp" "$OUT" \
+    'msg="unlocked" gpu=0 trigger=exit'
+  assert_count "one activity and one exit release are attempted" \
+    "$STATE/fault-argv.log" ' -i 0 -rgc' 2
+  assert_file_gone "the verified release removes the marker" "$DSTATE/gpu0.locked"
+}
+
+case_clamp_unverified_lgc_failed() {
+  new_case clamp-unverified-lgc
+  # The driver refuses -lgc, but it may have applied part of the request before
+  # failing: the marker was recorded first, so the GPU stays a release target
+  # and the exit path must still run -rgc. No clamp may be reported as applied.
+  start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 \
+    FAKE_LGC_RC=4 \
+    FAKE_LGC_STDERR='The current user does not have permission to change clocks'
+  if ! wait_for_count "$OUT" 'msg="clamp unverified"' 1 60; then
+    fail "the rejected clamp is reported" "no 'clamp unverified' within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_has "the rejected clamp carries its return code" "$OUT" \
+    'level=error msg="clamp unverified" gpu=0 trigger=idle rc=4'
+  assert_has "the rejected clamp keeps nvidia-smi stderr" "$OUT" 'does not have permission'
+  assert_has "the rejected clamp says it will release" "$OUT" 'action="release-retry"'
+  assert_lacks "a rejected clamp is never called verified" "$OUT" 'msg="clamp verified"'
+  assert_file_exists "the intent marker is recorded before -lgc" "$DSTATE/gpu0.locked"
+  stop_daemon 0.3
+  assert_rc "the stop after a rejected clamp exits 0" 0 "$RUN_RC"
+  assert_count "the exit path still attempts the release" "$ARGV" ' -i 0 -rgc' 1
+  assert_has "the attempted release is reported" "$OUT" 'msg="unlocked" gpu=0 trigger=exit'
+  assert_file_gone "the verified release clears the intent marker" "$DSTATE/gpu0.locked"
 }
 
 # --- #6: a failed unlock is never reported as success ----------------------
@@ -887,6 +997,46 @@ case_state_stale_marker_only_that_gpu() {
   assert_file_gone "no marker is invented for the unmarked GPU" "$DSTATE/gpu1.locked"
 }
 
+# --- #45: a failed startup release stays a release target -------------------
+case_startup_unlock_retried_on_activity() {
+  local wrapper
+  new_case startup-unlock-retry
+  wrapper=$(make_fault_wrapper "$CASE_DIR/bin")
+  # A previous instance left a verified clamp behind (marker + 135 MHz). The
+  # first -rgc of this start fails, so the release has to stay pending and be
+  # retried on the next busy sample instead of being forgotten with LOCKED=0.
+  printf '135\n' > "$STATE/clock.0"
+  : > "$DSTATE/gpu0.locked"
+  start_daemon GPU=0 NVSMI="$wrapper" FAKE_REAL="$FAKE" FAKE_RGC_FAIL_ONCE=1 \
+    IDLE_SECONDS=30 SAMPLE_MS=50 FAKE_STREAM_UTILS='0 0 99' FAKE_STREAM_SLEEP=0.3
+  if ! wait_for_count "$OUT" 'msg="startup unlock failed"' 1 60; then
+    fail "a failed startup release is reported" "no 'startup unlock failed'"
+    stop_daemon 0.1
+    return
+  fi
+  assert_has "the failed startup release is an error with an action" "$OUT" \
+    'level=error msg="startup unlock failed" gpu=0 action="retry-on-activity"'
+  assert_has "the failed release keeps the old warning" "$OUT" \
+    'level=warn msg="unlock failed" gpu=0 trigger=startup'
+  assert_has "the start is not claimed to be clean" "$OUT" 'level=warn msg="started"'
+  assert_has "the start line names the GPU awaiting release" "$OUT" 'unlock_pending=0'
+  assert_file_exists "the stale marker survives the failed startup release" \
+    "$DSTATE/gpu0.locked"
+
+  if ! wait_for_count "$OUT" 'msg="unlocked" gpu=0 trigger=util util_pct=99' 1 60; then
+    fail "activity retries the failed startup release" "no util release within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_count "the startup release is retried exactly once" \
+    "$STATE/fault-argv.log" ' -i 0 -rgc' 2
+  assert_eq "the retried release restores the clock" 1260 \
+    "$(cat "$STATE/clock.0" 2>/dev/null)"
+  assert_file_gone "the successful retry removes the stale marker" "$DSTATE/gpu0.locked"
+  stop_daemon 0.2
+  assert_rc "the daemon stops cleanly after the retry" 0 "$RUN_RC"
+}
+
 # --- #9: --unlock is the recovery path a SIGKILL cannot skip ---------------
 case_unlock_cli_marked_only() {
   new_case unlock-cli
@@ -943,6 +1093,48 @@ case_unlock_after_sigkill() {
   assert_has "the leftover clamp is released" "$OUT" 'msg="unlocked" gpu=0 trigger=unlock'
   assert_file_gone "the marker is removed after the recovery release" "$DSTATE/gpu0.locked"
   assert_count "the recovery resets the clamped GPU once" "$ARGV" ' -i 0 -rgc' 1
+}
+
+# --- #48: keep-clocks suppresses both stop release paths --------------------
+case_keep_clocks_on_stop() {
+  new_case keep-clocks-stop
+  start_daemon IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1
+  if ! wait_for_count "$OUT" 'msg="clamp verified"' 1 60; then
+    fail "the clamp is in place before --keep-clocks" "no clamp within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  assert_file_exists "the clamp has a marker before the kept stop" "$DSTATE/gpu0.locked"
+  # What the uninstaller does before stopping the units with --keep-clocks.
+  : > "$DSTATE/keep-clocks"
+  stop_daemon 0.2
+  assert_rc "a stop with keep-clocks exits 0" 0 "$RUN_RC"
+  assert_has "the kept clocks are reported" "$OUT" \
+    'msg="clocks kept" reason="keep-clocks" gpu=0'
+  assert_count "a kept stop never releases the clock" "$ARGV" ' -i 0 -rgc' 0
+  assert_lacks "a kept stop never claims an unlock" "$OUT" 'msg="unlocked"'
+  assert_file_exists "a kept stop leaves the marker in place" "$DSTATE/gpu0.locked"
+  assert_eq "the clamped clock is still in effect" 135 \
+    "$(cat "$STATE/clock.0" 2>/dev/null)"
+  assert_has "the exit line still reports the stop" "$OUT" 'msg="exit" gpu=0 rc=0'
+}
+
+case_keep_clocks_on_unlock() {
+  new_case keep-clocks-unlock
+  printf '135\n' > "$STATE/clock.0"
+  : > "$DSTATE/gpu0.locked"
+  : > "$DSTATE/keep-clocks"
+  # ExecStopPost runs --unlock after the stop, including after a SIGKILL: it has
+  # to honour the same keep-clocks request and still be a successful stop.
+  run_cli GPU=0 -- --unlock
+  assert_rc "--unlock with keep-clocks exits 0" 0 "$RUN_RC"
+  assert_has "--unlock honours keep-clocks" "$OUT" \
+    'msg="clocks kept" reason="keep-clocks" gpu=0'
+  assert_count "--unlock with keep-clocks never resets the clock" "$ARGV" ' -i 0 -rgc' 0
+  assert_lacks "--unlock with keep-clocks never claims an unlock" "$OUT" 'msg="unlocked"'
+  assert_file_exists "--unlock with keep-clocks leaves the marker" "$DSTATE/gpu0.locked"
+  assert_eq "--unlock with keep-clocks leaves the clock clamped" 135 \
+    "$(cat "$STATE/clock.0" 2>/dev/null)"
 }
 
 case_unlock_help() {
@@ -1054,6 +1246,8 @@ case_clamp_not_applied
 case_clamp_failed_backoff_short
 case_clamp_failed_backoff_grows
 case_clamp_reassert
+case_clamp_unverified_readback
+case_clamp_unverified_lgc_failed
 case_unlock_failed_activity
 case_unlock_failed_stop
 case_stop_is_success
@@ -1082,9 +1276,12 @@ case_cli_no_args_starts
 case_state_dir_created
 case_state_fresh_run_untouched
 case_state_stale_marker_only_that_gpu
+case_startup_unlock_retried_on_activity
 case_unlock_cli_marked_only
 case_unlock_cli_failure_keeps_marker
 case_unlock_after_sigkill
+case_keep_clocks_on_stop
+case_keep_clocks_on_unlock
 case_unlock_help
 case_cooldown_suppresses_then_allows
 case_second_instance_exits_3
