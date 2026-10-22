@@ -23,10 +23,15 @@
 #                   removed only after a verified release. A marker that outlives
 #                   the process is a clamp (or a clamp attempt) that outlived it,
 #                   so startup and --unlock release exactly those GPUs
-#                   (#9, #20, #44).
+#                   (#9, #20, #44). Deliberate trade-off: because the intent is
+#                   written before -lgc, an attempt that fails immediately still
+#                   leaves it, and a later --unlock may reset a lock that another
+#                   tool set on that GPU in between.
 #   gpu<N>.lock     flock(1) target that keeps a second instance off the GPU (#21).
 #   keep-clocks     empty file: a stop must not release the clocks. The
-#                   uninstaller writes it for --keep-clocks (#48).
+#                   uninstaller writes it for --keep-clocks (#48). It covers the
+#                   stop paths only: a start ignores it and still releases stale
+#                   markers, so a keep does not survive a restart.
 set -uo pipefail
 
 # Release version reported by --version.
@@ -351,7 +356,9 @@ state_keepfile() { printf '%s/keep-clocks' "$STATE_DIR"; }
 # The uninstaller creates this file before it stops the units when it was asked
 # to keep the clocks. Every stop path in this script (the EXIT trap and the
 # ExecStopPost --unlock) has to honour it, otherwise a normal stop releases the
-# clamp before the uninstaller reports that it kept it (issue #48).
+# clamp before the uninstaller reports that it kept it (issue #48). A start does
+# not consult it: a keep is a property of the stop paths, so a restart still
+# releases the stale marker of the previous instance.
 keep_clocks() { [ -e "$(state_keepfile)" ]; }
 
 ensure_state_dir() {
@@ -767,7 +774,9 @@ cleanup() { # status to preserve
     kill -KILL "$SLEEP_PID" 2>/dev/null || true
     SLEEP_PID=""
   fi
-  if [ -n "$STREAM_ERR" ] && [ "$STREAM_ERR" != "/dev/null" ]; then rm -f "$STREAM_ERR"; fi
+  if [ -n "${STREAM_ERR:-}" ] && [ "${STREAM_ERR:-}" != "/dev/null" ]; then
+    rm -f "$STREAM_ERR"
+  fi
   # --keep-clocks (issue #48): the uninstaller creates this file before it stops
   # the units. A release here would undo the request, so a stop leaves the
   # clamp and the markers in place and still counts as a successful stop.
@@ -804,8 +813,13 @@ RECONNECT_MAX=5
 RECONNECT_WINDOW_MS=60000
 
 # First stderr line of the utilization stream, so a missing driver or tool is
-# visible instead of being discarded.
-STREAM_ERR=$(mktemp "${TMPDIR:-/tmp}/nvidia-idle-clock.XXXXXX" 2>/dev/null) || STREAM_ERR=/dev/null
+# visible instead of being discarded. The temp file itself is allocated further
+# down, only after the per-GPU exclusion and after the EXIT trap exists (release
+# audit): created here it was never removed on the two early exits (unusable
+# state dir, GPU already managed), because those return before a trap could
+# clean it up.
+# Empty means "not allocated yet" and cleanup() has nothing to remove.
+STREAM_ERR=""
 RETRY_S=$RETRY_MIN_S
 STREAM_LOGGED=0
 LAST_STREAM_ERR=""
@@ -821,7 +835,9 @@ SLEEP_PID=""
 # Taken before any clock is touched and before the EXIT trap exists: a second
 # instance that targets a GPU the first one manages must not run its startup or
 # exit unlock against that GPU at all. Exiting here leaves no trap behind, so
-# nothing this instance started can release the live instance's clamp.
+# nothing this instance started can release the live instance's clamp. The
+# stream temp file is allocated below this block for the same reason: an exit
+# here must not leave anything behind.
 if ! ensure_state_dir; then
   log error "state dir unavailable" "dir=$STATE_DIR" \
     "hint=\"the daemon cannot record which GPUs it clamped\""
@@ -846,6 +862,12 @@ unset _g
 
 trap 'cleanup $?' EXIT
 trap 'cleanup 0' INT TERM
+
+# Allocated once a trap exists, so every exit from here on removes it again.
+# From here on nothing returns without running cleanup(): the per-GPU lock is
+# held, and creating the file cannot fail the start - if mktemp fails, stderr
+# goes to /dev/null and the daemon keeps working (#24).
+STREAM_ERR=$(mktemp "${TMPDIR:-/tmp}/nvidia-idle-clock.XXXXXX" 2>/dev/null) || STREAM_ERR=/dev/null
 
 # --- startup log contract --------------------------------------------------
 # The first lines of a start are stable and greppable:

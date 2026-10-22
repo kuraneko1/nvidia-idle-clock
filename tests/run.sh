@@ -134,6 +134,26 @@ assert_no_gpu_calls() { # name
   if [ "$n" -eq 0 ]; then pass "$1"; else fail "$1" "nvidia-smi was called $n time(s)"; fi
 }
 
+# The utilization stream's stderr goes to a mktemp(1) file named
+# nvidia-idle-clock.XXXXXX. Counted with a glob rather than find(1) so the
+# suite keeps its dependencies, and with an -e guard because nullglob is not set.
+count_daemon_tempfiles() { # dir -> count on stdout
+  local dir="$1" f n=0
+  for f in "$dir"/nvidia-idle-clock.*; do
+    if [ -e "$f" ]; then n=$(( n + 1 )); fi
+  done
+  printf '%s' "$n"
+}
+assert_no_tempfiles() { # name dir
+  local n
+  n=$(count_daemon_tempfiles "$2")
+  if [ "$n" -eq 0 ]; then
+    pass "$1"
+  else
+    fail "$1" "$n file(s) matching nvidia-idle-clock.* left in $2"
+  fi
+}
+
 new_case() { # name
   reap_case_processes
   CASE_DIR="$WORK/$1"
@@ -1229,6 +1249,61 @@ case_flock_missing_still_starts() {
     "$DSTATE/gpu0.locked"
 }
 
+# --- release audit: no temp file outlives an early exit ---------------------
+# The stream's stderr file may only be allocated once the EXIT trap exists, so
+# the exits that return before it (unusable state dir, missing nvidia-smi, GPU
+# already managed) must leave the owner's TMPDIR untouched. Each case points
+# TMPDIR at its own directory and counts what is left there.
+case_no_tempfile_on_exit1() {
+  local state_tmp nvsmi_tmp blocked
+  new_case tempfile-exit1
+  state_tmp="$CASE_DIR/tmp-state"
+  nvsmi_tmp="$CASE_DIR/tmp-nvsmi"
+  blocked="$CASE_DIR/blocked"
+  mkdir -p "$state_tmp" "$nvsmi_tmp"
+  # A regular file where a directory is needed makes ensure_state_dir fail for
+  # root and non-root alike: this is the exit 1 the leak came from.
+  : > "$blocked"
+  run_daemon TMPDIR="$state_tmp" STATE_DIR="$blocked/state"
+  assert_rc "an unusable state directory exits 1" 1 "$RUN_RC"
+  assert_has "the unusable state directory is reported" "$OUT" \
+    'msg="state dir unavailable"'
+  assert_no_tempfiles "exit 1 leaves no nvidia-idle-clock.* temp file" "$state_tmp"
+  # The other exit 1 returns even earlier, when nvidia-smi is missing: nothing
+  # may be allocated there either. A separate TMPDIR keeps the two assertions
+  # independent, so a leak from the first run cannot fail the second one.
+  run_daemon TMPDIR="$nvsmi_tmp" NVSMI=/nonexistent/nvidia-smi
+  assert_rc "a missing nvidia-smi exits 1" 1 "$RUN_RC"
+  assert_has "the missing nvidia-smi is reported" "$OUT" 'msg="nvidia-smi not found"'
+  assert_no_tempfiles "a missing nvidia-smi leaves no temp file" "$nvsmi_tmp"
+}
+
+case_no_tempfile_on_exit3() {
+  local dup_tmp live_tmp
+  new_case tempfile-exit3
+  dup_tmp="$CASE_DIR/tmp-dup"
+  live_tmp="$CASE_DIR/tmp-live"
+  mkdir -p "$dup_tmp" "$live_tmp"
+  start_daemon GPU=0 IDLE_SECONDS=0 SAMPLE_MS=50 SKIP_IF_LOW=1 TMPDIR="$live_tmp"
+  if ! wait_for_count "$OUT" 'msg="clamp verified"' 1 60; then
+    fail "the live instance holds the GPU lock" "no clamp within 6 s"
+    stop_daemon 0.1
+    return
+  fi
+  # A start owns its file once it holds the per-GPU flock ...
+  assert_eq "a running instance owns exactly one temp file" 1 \
+    "$(count_daemon_tempfiles "$live_tmp")"
+  # ... so a duplicate that loses the flock must not create one.
+  run_daemon TMPDIR="$dup_tmp" GPU=0 IDLE_SECONDS=30
+  assert_rc "a duplicate instance exits 3" 3 "$RUN_RC"
+  assert_has "the duplicate is reported as an error" "$OUT" 'msg="gpu already managed"'
+  assert_no_tempfiles "exit 3 leaves no nvidia-idle-clock.* temp file" "$dup_tmp"
+  # The owner still creates one and cleanup() still removes it.
+  stop_daemon 0.3
+  assert_rc "the live instance stops cleanly" 0 "$RUN_RC"
+  assert_no_tempfiles "a clean stop removes the temp file" "$live_tmp"
+}
+
 # --- run everything --------------------------------------------------------
 case_config_util_threshold
 case_config_gpu_glob
@@ -1286,6 +1361,8 @@ case_unlock_help
 case_cooldown_suppresses_then_allows
 case_second_instance_exits_3
 case_flock_missing_still_starts
+case_no_tempfile_on_exit1
+case_no_tempfile_on_exit3
 
 # --- no leaked stream children --------------------------------------------
 # The daemon kills its utilization-stream child on the way out (issue #7), and
