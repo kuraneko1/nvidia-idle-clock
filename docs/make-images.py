@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Generate the README/reference figures as mobile-app-style cards.
+"""Generate the README/reference figures as mobile-app-style cards, in English and Japanese.
 
 Every number drawn here is copied from the "Measurements" section of
 docs/reference.{ja,en}.md; keep the two in sync when a measurement changes.
-The output is deterministic: fixed data, fixed dpi, no timestamps or
-randomness, then re-encoded to RGB PNG without metadata.
+The visible text lives in one string table per language (TEXT below), so the
+two variants share the same layout, palette and numbers. The output is
+deterministic: fixed data, fixed dpi, no timestamps or randomness, then
+re-encoded to RGB PNG without metadata.
 
 Usage:
     python3 docs/make-images.py
 
-Requires matplotlib (3.x) + Pillow. Japanese text needs Noto Sans CJK JP;
-the labels are English today, so the font is only a fallback-safe choice.
+Writes img/ja/<name>.png and img/en/<name>.png.
+
+Requires matplotlib (3.x) + Pillow. Japanese text is drawn with Noto Sans CJK
+JP loaded from an explicit file (the .ttc faces are not reliably selected by
+family name); the English set keeps the family-name fonts used before.
 """
 
 from __future__ import annotations
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib
@@ -33,8 +39,15 @@ from PIL import Image  # noqa: E402
 # --------------------------------------------------------------------------
 
 DPI = 150
-FONT = "Noto Sans CJK JP"
-FONT_CODE = "DejaVu Sans Mono"
+LATIN_SANS = "Noto Sans CJK JP"
+LATIN_MONO = "DejaVu Sans Mono"
+
+# Verified Japanese faces: matplotlib FontProperties(fname=...) renders these
+# correctly on this host.
+JA_SANS = {
+    "normal": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "bold": "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+}
 
 BG = "#F4F6FA"  # page background
 CARD = "#FFFFFF"  # card fill
@@ -95,7 +108,7 @@ PERF = {
         {"name": "SGEMM 4096", "clamped_pct": 8.9},
     ],
     "released_pct": 100.0,
-    "callout": "up to 11× slower while clamped",
+    "slowdown_mult": 11,  # 100 / 8.9 == 11.2 -> "up to 11x"
 }
 
 # Clamp/release cycle, PG500-216, 8GiB held (timeline run).
@@ -107,22 +120,129 @@ TIMELINE = {
 }
 
 # --------------------------------------------------------------------------
-# Drawing helpers
+# String table — the only place the visible language lives.
+# --------------------------------------------------------------------------
+
+TEXT = {
+    "en": {
+        "hero": {
+            "eyebrow": "measured effect · two V100-class cards",
+            "saved": "saved while VRAM is held",
+            "combined": "two cards, combined",
+            "held": "VRAM held · per-GPU average",
+            "held_chip": "SAVED",
+            "empty": "VRAM empty · per-GPU average",
+            "empty_chip": "NO SAVING",
+            "energy": "{kwh:.1f} kWh/year  ·  ¥{jpy:,}/year @ {rate} JPY/kWh "
+            "(Shizuoka example)",
+            "conditions": "GPU board power · measured {measured} · driver {driver}",
+        },
+        "ladder": {
+            "eyebrow": "clamp ladder",
+            "sub": "PG500-216 · 8 GiB held · 20 s each",
+            "no_clamp": "no clamp",
+        },
+        "perf": {
+            "eyebrow": "throughput while clamped",
+            "sub": "PG500-216 · 8 GiB held",
+            "legend_released": "after release",
+            "legend_clamped": "clamped {mhz} MHz",
+            "tag_clamped": "clamped",
+            "tag_released": "released",
+            "callout": "up to {mult}× slower while clamped",
+        },
+        "timeline": {
+            "eyebrow": "clamp / release cycle",
+            "sub": "PG500-216 · 8 GiB held · schematic",
+            "release_value": "≤ {s:.1f} s",
+            "release_caption": "release after load detected",
+            "idle_value": "{s:.1f} s",
+            "idle_caption": "idle before re-clamp",
+        },
+    },
+    "ja": {
+        "hero": {
+            "eyebrow": "実測効果 · V100 クラス 2 枚",
+            "saved": "VRAM 保持中の節電",
+            "combined": "2 枚合計",
+            "held": "VRAM 保持中 · 1 枚あたり平均",
+            "held_chip": "節電",
+            "empty": "VRAM 空き · 1 枚あたり平均",
+            "empty_chip": "節電なし",
+            "energy": "{kwh:.1f} kWh/年  ·  ¥{jpy:,}/年 @ {rate} JPY/kWh "
+            "(静岡の例)",
+            "conditions": "GPU ボード電力 · 実測 {measured} · driver {driver}",
+        },
+        "ladder": {
+            "eyebrow": "クランプ階段",
+            "sub": "PG500-216 · 8 GiB 保持 · 各 20 秒",
+            "no_clamp": "クランプなし",
+        },
+        "perf": {
+            "eyebrow": "クランプ中のスループット",
+            "sub": "PG500-216 · 8 GiB 保持",
+            "legend_released": "解除後",
+            "legend_clamped": "クランプ中 {mhz} MHz",
+            "tag_clamped": "クランプ中",
+            "tag_released": "解除後",
+            "callout": "クランプ中は最大 {mult} 倍遅い",
+        },
+        "timeline": {
+            "eyebrow": "クランプ / 解除サイクル",
+            "sub": "PG500-216 · 8 GiB 保持 · 模式図",
+            "release_value": "≤ {s:.1f} 秒",
+            "release_caption": "負荷検出から解除まで",
+            "idle_value": "{s:.1f} 秒",
+            "idle_caption": "再クランプまでの無負荷",
+        },
+    },
+}
+
+LANGS = ("en", "ja")
+
+
+# --------------------------------------------------------------------------
+# Fonts
 # --------------------------------------------------------------------------
 
 
-def text_px(s: str, size: float, weight: str = "normal", family: str = FONT) -> float:
+@lru_cache(maxsize=None)
+def ja_font_path(weight: str) -> str:
+    path = JA_SANS.get(weight, JA_SANS["normal"])
+    if not Path(path).exists():
+        raise SystemExit(f"Japanese font not found: {path}")
+    return path
+
+
+@lru_cache(maxsize=None)
+def font_prop(lang: str, weight: str = "normal", mono: bool = False, size: float = 12.0) -> FontProperties:
+    """Font for *lang*. Japanese code strings stay monospace while ASCII."""
+    if lang == "ja":
+        if mono:
+            # Monospace is only requested for ASCII technical tokens such as
+            # "-lgc 135,555"; text()/text_px() keep CJK strings on the CJK face.
+            return FontProperties(family=LATIN_MONO, weight=weight, size=size)
+        return FontProperties(fname=ja_font_path(weight), size=size)
+    family = LATIN_MONO if mono else LATIN_SANS
+    return FontProperties(family=family, weight=weight, size=size)
+
+
+def text_px(
+    s: str, size: float, weight: str = "normal", mono: bool = False, lang: str = "en"
+) -> float:
     """Rendered width of *s* in pixels at *size* points."""
     if not s:
         return 0.0
-    prop = FontProperties(family=family, weight=weight, size=size)
+    # A CJK string never goes through the monospace face.
+    prop = font_prop(lang, weight, mono and s.isascii(), size)
     return TextPath((0, 0), s, size=size, prop=prop).get_extents().width * DPI / 72.0
 
 
 class Canvas:
     """A pixel-addressed canvas: y grows downwards, like a screen."""
 
-    def __init__(self, w: int, h: int) -> None:
+    def __init__(self, lang: str, w: int, h: int) -> None:
+        self.lang = lang
         self.w, self.h = w, h
         self.fig = plt.figure(figsize=(w / DPI, h / DPI), dpi=DPI, facecolor=BG)
         self.ax = self.fig.add_axes((0, 0, 1, 1))
@@ -167,25 +287,23 @@ class Canvas:
         weight: str = "normal",
         ha: str = "left",
         va: str = "center",
-        family: str = FONT,
+        mono: bool = False,
         zorder: int = 5,
     ):
         return self.ax.text(
             x,
             y,
             s,
-            fontsize=size,
+            fontproperties=font_prop(self.lang, weight, mono and s.isascii(), size),
             color=color,
-            fontweight=weight,
             ha=ha,
             va=va,
-            family=family,
             zorder=zorder,
         )
 
     def chip_width(self, label: str, size: float = 10.5, dot: bool = True, pad: float = 16) -> float:
         dot_w = 18 if dot else 0
-        return pad * 2 + dot_w + text_px(label, size, "bold")
+        return pad * 2 + dot_w + text_px(label, size, "bold", lang=self.lang)
 
     def chip(
         self,
@@ -218,12 +336,12 @@ class Canvas:
             self.ax.add_patch(
                 Circle((x + pad + 4, y), radius=4.5, facecolor=color, linewidth=0, zorder=4)
             )
-        self.text(x + pad + dot_w, y, label, size, color, weight, zorder=5)
+        self.text(x + pad + dot_w, y, label, size, color, weight)
         return w
 
     def eyebrow(self, title: str, sub: str, y: float = 34, x: float = 40) -> None:
         self.text(x, y, title, 13, INK, "bold")
-        self.text(x + text_px(title, 13, "bold") + 10, y, sub, 11.5, MUTED)
+        self.text(x + text_px(title, 13, "bold", lang=self.lang) + 10, y, sub, 11.5, MUTED)
 
     def save(self, path: Path) -> tuple[int, int, int]:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,21 +365,22 @@ class Canvas:
 
 
 # --------------------------------------------------------------------------
-# Figure 1 — img/hero.png
+# Figure 1 — hero
 # --------------------------------------------------------------------------
 
 
-def fig_hero() -> None:
-    c = Canvas(1500, 640)
-    c.eyebrow("nvidia-idle-clock", "measured effect · two V100-class cards")
+def fig_hero(lang: str) -> Canvas:
+    t = TEXT[lang]["hero"]
+    c = Canvas(lang, 1500, 640)
+    c.eyebrow("nvidia-idle-clock", t["eyebrow"])
 
     # Headline card.
     c.card(40, 58, 690, 250)
-    c.text(72, 96, "saved while VRAM is held", 12.5, MUTED)
+    c.text(72, 96, t["saved"], 12.5, MUTED)
     num = f"{IDLE['saved_total_w']:.1f}"
     c.text(68, 182, num, 64, GREEN, "bold")
-    c.text(68 + text_px(num, 64, "bold") + 28, 200, "W", 30, GREEN, "bold")
-    c.text(72, 266, "two cards, combined", 10.5, MUTED)
+    c.text(68 + text_px(num, 64, "bold", lang=lang) + 28, 200, "W", 30, GREEN, "bold")
+    c.text(72, 266, t["combined"], 10.5, MUTED)
 
     # Per-GPU breakdown.
     for y, gpu in ((58, IDLE["gpu0"]), (194, IDLE["gpu1"])):
@@ -273,30 +392,40 @@ def fig_hero() -> None:
     # VRAM held vs empty.
     held, empty = IDLE["held"], IDLE["empty"]
     c.card(40, 330, 700, 170)
-    c.text(72, 366, "VRAM held · per-GPU average", 11, MUTED)
-    c.chip(712 - c.chip_width("SAVED"), 366, "SAVED", GREEN, fill=GREEN_TINT, dot=False)
+    c.text(72, 366, t["held"], 11, MUTED)
+    c.chip(712 - c.chip_width(t["held_chip"]), 366, t["held_chip"], GREEN, fill=GREEN_TINT, dot=False)
     # The after-value is green: this card is the one that saves something.
     before_s = f"{held['before_w']:.1f} W"
     after_s = f"{held['after_w']:.1f} W"
     c.text(72, 428, before_s, 24, INK, "bold")
-    arrow_x = 72 + text_px(before_s, 24, "bold") + 14
+    arrow_x = 72 + text_px(before_s, 24, "bold", lang=lang) + 14
     c.text(arrow_x, 428, "→", 24, MUTED, "bold")
-    c.text(arrow_x + text_px("→", 24, "bold") + 14, 428, after_s, 24, GREEN, "bold")
+    c.text(
+        arrow_x + text_px("→", 24, "bold", lang=lang) + 14, 428, after_s, 24, GREEN, "bold"
+    )
 
     c.card(760, 330, 700, 170)
-    c.text(792, 366, "VRAM empty · per-GPU average", 11, MUTED)
-    c.chip(1432 - c.chip_width("NO SAVING"), 366, "NO SAVING", MUTED, fill="#F2F4F7", dot=False)
+    c.text(792, 366, t["empty"], 11, MUTED)
+    c.chip(
+        1432 - c.chip_width(t["empty_chip"]),
+        366,
+        t["empty_chip"],
+        MUTED,
+        fill="#F2F4F7",
+        dot=False,
+    )
     empty_s = f"{empty['before_w']:.1f} W → {empty['after_w']:.1f} W"
     c.text(792, 428, empty_s, 24, MUTED, "bold")
-    c.text(792 + text_px(empty_s, 24, "bold") + 14, 430, "≈ 0", 17, MUTED, "bold")
+    c.text(792 + text_px(empty_s, 24, "bold", lang=lang) + 14, 430, "≈ 0", 17, MUTED, "bold")
 
     # Footer strip.
     c.card(40, 518, 1420, 86, RADIUS_ROW, fill=CARD)
     c.text(
         72,
         546,
-        f"{IDLE['kwh_year']:.1f} kWh/year  ·  ¥{IDLE['jpy_year']:,}/year @ {IDLE['jpy_per_kwh']} JPY/kWh "
-        "(Shizuoka example)",
+        t["energy"].format(
+            kwh=IDLE["kwh_year"], jpy=IDLE["jpy_year"], rate=IDLE["jpy_per_kwh"]
+        ),
         15,
         INK,
         "bold",
@@ -304,22 +433,22 @@ def fig_hero() -> None:
     c.text(
         72,
         584,
-        f"GPU board power · measured {IDLE['measured']} · driver {IDLE['driver']}",
+        t["conditions"].format(measured=IDLE["measured"], driver=IDLE["driver"]),
         10.5,
         MUTED,
     )
-
-    print("img/hero.png", c.save(OUT / "hero.png"))
+    return c
 
 
 # --------------------------------------------------------------------------
-# Figure 2 — img/clamp-ladder.png
+# Figure 2 — clamp ladder
 # --------------------------------------------------------------------------
 
 
-def fig_ladder() -> None:
-    c = Canvas(1500, 700)
-    c.eyebrow("clamp ladder", "PG500-216 · 8 GiB held · 20 s each")
+def fig_ladder(lang: str) -> Canvas:
+    t = TEXT[lang]["ladder"]
+    c = Canvas(lang, 1500, 700)
+    c.eyebrow(t["eyebrow"], t["sub"])
 
     top, row_h, gap = 70, 138, 16
     bar_x, bar_max = 520, 560
@@ -329,8 +458,9 @@ def fig_ladder() -> None:
         y = top + i * (row_h + gap)
         c.card(40, y, 1420, row_h, RADIUS_ROW)
         c.text(72, y + 56, f"{row['mhz']}", 38, INK, "bold")
-        c.text(72 + text_px(f"{row['mhz']}", 38, "bold") + 24, y + 72, "MHz", 15, MUTED)
-        c.text(72, y + 100, row["cmd"], 11, MUTED, family=FONT_CODE)
+        c.text(72 + text_px(f"{row['mhz']}", 38, "bold", lang=lang) + 24, y + 72, "MHz", 15, MUTED)
+        cmd = t["no_clamp"] if row["cmd"] == "no clamp" else row["cmd"]
+        c.text(72, y + 100, cmd, 11, MUTED, mono=True)
 
         length = bar_max * row["w"] / max_w
         c.ax.add_patch(
@@ -345,22 +475,26 @@ def fig_ladder() -> None:
             )
         )
         c.text(bar_x + length + 18, y + 57, f"{row['w']:.2f} W", 17, INK, "bold")
-
-    print("img/clamp-ladder.png", c.save(OUT / "clamp-ladder.png"))
+    return c
 
 
 # --------------------------------------------------------------------------
-# Figure 3 — img/perf.png
+# Figure 3 — throughput while clamped
 # --------------------------------------------------------------------------
 
 
-def fig_perf() -> None:
-    c = Canvas(1500, 640)
-    c.eyebrow("throughput while clamped", f"{PERF['pg500']} · {PERF['vram']}")
+def fig_perf(lang: str) -> Canvas:
+    t = TEXT[lang]["perf"]
+    c = Canvas(lang, 1500, 640)
+    c.eyebrow(t["eyebrow"], t["sub"])
 
     # Legend, right aligned: clamped = amber, after release = green.
+    legend = (
+        (t["legend_released"], GREEN),
+        (t["legend_clamped"].format(mhz=TIMELINE["clamped"]["mhz"]), AMBER),
+    )
     cursor = 1460.0
-    for label, color in (("after release", GREEN), ("clamped 135 MHz", AMBER)):
+    for label, color in legend:
         w = c.chip_width(label)
         cursor -= w
         c.chip(cursor, 34, label, color)
@@ -377,7 +511,10 @@ def fig_perf() -> None:
         c.text(center, 124, test["name"], 15, INK, "bold", ha="center")
 
         for j, (pct, color, tag) in enumerate(
-            ((test["clamped_pct"], AMBER, "clamped"), (PERF["released_pct"], GREEN, "released"))
+            (
+                (test["clamped_pct"], AMBER, t["tag_clamped"]),
+                (PERF["released_pct"], GREEN, t["tag_released"]),
+            )
         ):
             bx = center - 90 + j * 96
             bh = max_bar * pct / 100.0
@@ -407,19 +544,27 @@ def fig_perf() -> None:
     cw = 720
     cx = (1500 - cw) / 2
     c.card(cx, 544, cw, 64, 32, fill=AMBER_TINT)
-    c.text(1500 / 2, 576, PERF["callout"], 15, AMBER, "bold", ha="center")
-
-    print("img/perf.png", c.save(OUT / "perf.png"))
+    c.text(
+        1500 / 2,
+        576,
+        t["callout"].format(mult=PERF["slowdown_mult"]),
+        15,
+        AMBER,
+        "bold",
+        ha="center",
+    )
+    return c
 
 
 # --------------------------------------------------------------------------
-# Figure 4 — img/timeline.png
+# Figure 4 — clamp / release cycle
 # --------------------------------------------------------------------------
 
 
-def fig_timeline() -> None:
-    c = Canvas(1500, 600)
-    c.eyebrow("clamp / release cycle", f"{PERF['pg500']} · {PERF['vram']} · schematic")
+def fig_timeline(lang: str) -> Canvas:
+    t = TEXT[lang]["timeline"]
+    c = Canvas(lang, 1500, 600)
+    c.eyebrow(t["eyebrow"], t["sub"])
 
     c.card(40, 64, 1420, 400)
 
@@ -448,29 +593,53 @@ def fig_timeline() -> None:
 
     # Duration callouts.
     for x, value, caption in (
-        (40, f"≤ {TIMELINE['release_s']:.1f} s", "release after load detected"),
-        (770, f"{TIMELINE['idle_s']:.1f} s", "idle before re-clamp"),
+        (
+            40,
+            t["release_value"].format(s=TIMELINE["release_s"]),
+            t["release_caption"],
+        ),
+        (
+            770,
+            t["idle_value"].format(s=TIMELINE["idle_s"]),
+            t["idle_caption"],
+        ),
     ):
         c.card(x, 476, 690, 92, RADIUS_ROW)
         c.text(x + 40, 522, value, 30, BLUE, "bold")
-        c.text(x + 40 + text_px(value, 30, "bold") + 18, 522, caption, 11.5, MUTED)
-
-    print("img/timeline.png", c.save(OUT / "timeline.png"))
+        c.text(x + 40 + text_px(value, 30, "bold", lang=lang) + 18, 522, caption, 11.5, MUTED)
+    return c
 
 
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
+FIGURES = (
+    ("hero", fig_hero),
+    ("clamp-ladder", fig_ladder),
+    ("perf", fig_perf),
+    ("timeline", fig_timeline),
+)
+
+
+def render(lang: str) -> dict[str, tuple[int, int, int]]:
+    """Draw all four figures for *lang* into img/<lang>/."""
+    out_dir = ROOT / "img" / lang
+    sizes: dict[str, tuple[int, int, int]] = {}
+    for name, fn in FIGURES:
+        path = out_dir / f"{name}.png"
+        sizes[f"img/{lang}/{name}.png"] = fn(lang).save(path)
+        print(f"img/{lang}/{name}.png", sizes[f"img/{lang}/{name}.png"])
+    return sizes
+
 
 def main() -> int:
-    for fn in (fig_hero, fig_ladder, fig_perf, fig_timeline):
-        fn()
+    for lang in LANGS:
+        render(lang)
     return 0
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "img"
 
 if __name__ == "__main__":
     sys.exit(main())
