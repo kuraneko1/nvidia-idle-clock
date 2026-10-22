@@ -76,7 +76,7 @@ conditions and raw numbers.
 
 ## How it differs from stock
 
-![Measured timeline (PG500-216 / 8GiB held, older run): 27.8W while clamped at 135MHz, back to 1260MHz / 39.5W within 0.5s of load being detected, then re-clamped after 30.2s of no load](../img/timeline.png)
+![Clamp/release cycle step chart (PG500-216 / 8GiB in VRAM, schematic): clamped at 135MHz / 27.8W, load is detected and the clock is back at 1260MHz / 39.5W within ≤0.5s, then 30.2s of no load re-clamps it to 135MHz](../img/timeline.png)
 
 | | Stock (driver-managed) | With this daemon |
 |---|---|---|
@@ -340,7 +340,7 @@ with 141 clamp events in 24h.
 
 Effectiveness depends on VRAM state.
 
-![Bar chart of idle power (older 3.6GiB / 8GiB-held run): V100-PCIE-32GB drops from 36.3W to 24.9W, PG500-216 from 40.9W to 28.4W, and with VRAM empty both cards stay at 24.6/28.1W](../img/idle-power.png)
+![Idle-power cards (measured 2026-10-22): 26.2W saved across the two cards — GPU0 37.8W → 25.2W (-12.6W), GPU1 42.4W → 28.9W (-13.6W); per-GPU average with VRAM held 40.1W → 27.0W, with VRAM empty 27.3W → 27.2W (≈0, no saving). Footer: 229.6kWh/year, 8,494 JPY/year at 37 JPY/kWh (Shizuoka example), GPU board power, driver 580.178.04](../img/hero.png)
 
 **Method.** 4 × 600s samples, `nvidia-smi --loop-ms=500`, first 60s dropped. n≈1060–1067
 samples per GPU, stdev 0.05–0.33W. `utilization.gpu` was 0.0 (mean and maximum) in every
@@ -375,7 +375,7 @@ on the same board, so thermal drift cancels.
 
 (PG500-216 / 8GiB in VRAM, 20s each)
 
-![Bar chart of the clamp ladder: no clamp 1260MHz / 40.94W, -lgc 135,555 gives 555MHz / 31.73W, -lgc 135,300 gives 300MHz / 29.52W, -lgc 135,135 gives 135MHz / 28.40W](../img/clamp-ladder.png)
+![Clamp-ladder cards (PG500-216 / 8GiB in VRAM, 20s each): no clamp 1260MHz / 40.94W, -lgc 135,555 at 555MHz / 31.73W, -lgc 135,300 at 300MHz / 29.52W, -lgc 135,135 at 135MHz / 28.40W](../img/clamp-ladder.png)
 
 | Clamp | Actual clock | Power |
 |---|---|---|
@@ -388,7 +388,7 @@ on the same board, so thermal drift cancels.
 
 (PG500-216 / 8GiB in VRAM)
 
-![Bar chart of throughput ratios: while clamped DtoD copy is 19.4%, memset 12.0% and SGEMM 4096 8.9%; after release and on the realistic path (load injected, daemon auto-releases) all return to about 100%](../img/perf.png)
+![Throughput cards while clamped (PG500-216 / 8GiB in VRAM), as a share of the unclamped rate: DtoD copy 19.4%, memset 12.0%, SGEMM 4096 8.9%; after release all are ≈100%, so up to 11× slower while clamped](../img/perf.png)
 
 | Test | No clamp | Clamped @135MHz | After release | Realistic path\* |
 |---|---|---|---|---|
@@ -398,11 +398,9 @@ on the same board, so thermal drift cancels.
 
 \* load injected while clamped, daemon auto-releases (20s budget)
 
-> **Note on the figure title.** `../img/perf.png` is titled "Tesla V100", but the 8GiB-held run behind it
-> was made on the **PG500-216** (GV100 32GB). A V100-PCIE-32GB (4096-bit HBM2 at 877MHz,
-> ~898GB/s theoretical) cannot reach the memset figure of 1114.9GB/s, so do not read this table as
-> V100-PCIE-32GB absolute numbers. Absolute values are card-dependent; compare the clamped and
-> released ratios instead. The legend overlapping the plot is a known cosmetic issue.
+> **Which board these runs used.** Every 8GiB-held run is on the **PG500-216** (GV100 32GB) — the
+> clamp-ladder and performance figures come from that run, while the idle A/B is the 2026-10-22
+> measurement.
 
 ### Sample log
 
