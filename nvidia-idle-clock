@@ -19,10 +19,14 @@
 #   nvidia-idle-clock@<GPU index>.service   (Environment=GPU=%i)
 #
 # State lives in $STATE_DIR (default /run/nvidia-idle-clock), one marker per GPU:
-#   gpu<N>.locked   written after a verified clamp, removed on release. A marker
-#                   that outlives the process is a clamp that outlives it, so
-#                   startup and --unlock release exactly those GPUs (#9, #20).
+#   gpu<N>.locked   recovery intent: written before a clamp is requested and
+#                   removed only after a verified release. A marker that outlives
+#                   the process is a clamp (or a clamp attempt) that outlived it,
+#                   so startup and --unlock release exactly those GPUs
+#                   (#9, #20, #44).
 #   gpu<N>.lock     flock(1) target that keeps a second instance off the GPU (#21).
+#   keep-clocks     empty file: a stop must not release the clocks. The
+#                   uninstaller writes it for --keep-clocks (#48).
 set -uo pipefail
 
 # Release version reported by --version.
@@ -105,6 +109,8 @@ options:
                  OOM kill, stop timeout) and is what the unit runs as
                  ExecStopPost. It honours GPU and NVSMI from the environment,
                  touches marked GPUs only, and removes each marker it released.
+                 While $STATE_DIR/keep-clocks exists it releases nothing and
+                 exits 0 (the uninstaller's --keep-clocks).
 
 environment variables (all optional; the numeric knobs are validated before
 the daemon touches a GPU):
@@ -328,17 +334,25 @@ unset _g _max
 # --- state directory ------------------------------------------------------
 # The only record that "this instance clamped this GPU" is a marker file, named
 # after the GPU index:
-#   $STATE_DIR/gpu<N>.locked   written after a verified clamp, removed on release
+#   $STATE_DIR/gpu<N>.locked   written before a clamp, removed on release
 #   $STATE_DIR/gpu<N>.lock     flock(1) target for the per-GPU exclusion
-# A marker that outlives the process is a clamp that outlives the process, so
-# startup and --unlock release exactly the GPUs that were clamped and never a
-# GPU this daemon never touched (issues #9, #20).
+#   $STATE_DIR/keep-clocks     a stop must keep the clocks (uninstaller #48)
+# A marker that outlives the process is a clamp (or a clamp attempt) that
+# outlives the process, so startup and --unlock release exactly the GPUs that
+# were clamped and never a GPU this daemon never touched (issues #9, #20, #44).
 #
 # The directory is created here and not with RuntimeDirectory=: systemd removes
 # a runtime directory when the unit stops, i.e. exactly when a marker has to
 # survive a crash (issue #20).
 state_marker() { printf '%s/gpu%s.locked' "$STATE_DIR" "$1"; }
 state_lockfile() { printf '%s/gpu%s.lock' "$STATE_DIR" "$1"; }
+state_keepfile() { printf '%s/keep-clocks' "$STATE_DIR"; }
+
+# The uninstaller creates this file before it stops the units when it was asked
+# to keep the clocks. Every stop path in this script (the EXIT trap and the
+# ExecStopPost --unlock) has to honour it, otherwise a normal stop releases the
+# clamp before the uninstaller reports that it kept it (issue #48).
+keep_clocks() { [ -e "$(state_keepfile)" ]; }
 
 ensure_state_dir() {
   if [ ! -d "$STATE_DIR" ]; then
@@ -483,6 +497,13 @@ if [ "$UNLOCK_MODE" -eq 1 ]; then
       "hint=\"the marker directory cannot be created\""
     exit 1
   fi
+  # This is what the unit runs as ExecStopPost after every stop, including the
+  # stop the uninstaller does with --keep-clocks. Keeping the clocks is a
+  # successful stop: leave the markers for the next start and exit 0 (#48).
+  if keep_clocks; then
+    log info "clocks kept" "reason=\"keep-clocks\"" "gpu=$IDS"
+    exit 0
+  fi
   UNLOCK_RC=0
   UNLOCKED=()
   for _g in "${GPU_IDS[@]}"; do
@@ -517,7 +538,11 @@ if [ "$UNLOCK_MODE" -eq 1 ]; then
   exit "$UNLOCK_RC"
 fi
 # --- per-GPU state ---------------------------------------------------------
-# LOCKED      1 when we have verified a clock range lock
+# LOCKED      1 when we have verified a clock range lock, or when a marker from a
+#             previous instance proves one; 0 otherwise
+# UNVERIFIED  1 when a clamp was requested and recorded but the result could not
+#             be verified: the clock may be locked, so a release must be
+#             attempted on use, on exit and by --unlock (#44)
 # IDLE_MS     accumulated idle time (wall clock, see #19)
 # LAST_MS     wall-clock timestamp of the last sample counted for IDLE_MS
 # ASSERT_MS   time since the last successful re-assert
@@ -528,11 +553,13 @@ fi
 # UNLOCK_FAIL    an unlock failure was already logged
 # LAST_UNLOCK_MS wall-clock time of the last successful release, -1 = never
 # COOLDOWN_LOGGED  the "clamp delayed" line for the current cooldown was logged
-declare -A LOCKED=() IDLE_MS=() LAST_MS=() ASSERT_MS=() CLAMP_FAIL=() RETRY_MS=()
-declare -A UNKNOWN=() REASSERT_FAIL=() UNLOCK_FAIL=() LAST_UNLOCK_MS=() COOLDOWN_LOGGED=()
+declare -A LOCKED=() UNVERIFIED=() IDLE_MS=() LAST_MS=() ASSERT_MS=() CLAMP_FAIL=()
+declare -A RETRY_MS=() UNKNOWN=() REASSERT_FAIL=() UNLOCK_FAIL=() LAST_UNLOCK_MS=()
+declare -A COOLDOWN_LOGGED=()
 now_ms
 for g in "${GPU_IDS[@]}"; do
   LOCKED[$g]=0
+  UNVERIFIED[$g]=0
   IDLE_MS[$g]=0
   LAST_MS[$g]=$NOW_MS
   ASSERT_MS[$g]=0
@@ -563,7 +590,10 @@ backoff_seconds() { # consecutive failures -> 5,10,20,40,60,60...
 }
 
 # One failure line per failing streak: a rejected clamp used to be silent and
-# re-forked nvidia-smi on every sample (issue #2).
+# re-forked nvidia-smi on every sample (issue #2). The marker was recorded
+# before the request, so an unverified clamp is an unknown state that has to be
+# released rather than forgotten: it is logged with the action that follows
+# (issue #44).
 note_clamp_failure() { # index trigger rc observed stderr
   local idx="$1" trigger="$2" rc="$3" observed="$4" err="$5" attempt retry
   if [ "$trigger" = "reassert" ]; then
@@ -577,24 +607,36 @@ note_clamp_failure() { # index trigger rc observed stderr
   if [ "${CLAMP_FAIL[$idx]}" -gt 1 ]; then return 0; fi
   attempt="${CLAMP_FAIL[$idx]}"
   retry=$(backoff_seconds "$attempt")
-  if [ "$rc" -eq 0 ]; then
-    log error "clamp not applied" "gpu=$idx" "trigger=idle" "rc=$rc" "attempt=$attempt" \
-      "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" "observed_mhz=${observed:-?}" \
-      "retry_s=$retry" "stderr=\"$(oneline "$err")\""
-  else
-    log error "clamp failed" "gpu=$idx" "trigger=idle" "rc=$rc" "attempt=$attempt" \
-      "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" "retry_s=$retry" \
-      "stderr=\"$(oneline "$err")\""
-  fi
+  log error "clamp unverified" "gpu=$idx" "trigger=idle" "rc=$rc" "attempt=$attempt" \
+    "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" "observed_mhz=${observed:-?}" \
+    "action=\"release-retry\"" "retry_s=$retry" \
+    "stderr=\"$(oneline "$err")\""
 }
 
 apply_clamp() { # index trigger was_mhz
   local idx="$1" trigger="$2" was="$3" err rc observed
+  # Record the recovery intent BEFORE the clock is changed (issue #44). From
+  # here on a crash, a SIGKILL or an inconclusive read-back leaves a marker
+  # that the next activity sample, the exit path and --unlock can act on. If
+  # the intent cannot be recorded the clamp is not attempted at all: applying it
+  # without a recovery record is exactly the leak this marker prevents.
+  if ! mark_locked "$idx"; then
+    # Count the attempt so the caller backs off instead of re-forking a driver
+    # call every sample; nothing was changed, so there is nothing to release.
+    CLAMP_FAIL[$idx]=$(( ${CLAMP_FAIL[$idx]} + 1 ))
+    log error "clamp not applied" "gpu=$idx" "trigger=$trigger" \
+      "reason=state_marker_failed" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP"
+    return 1
+  fi
   # stderr is captured, not discarded: it is the only diagnosis available when
   # the driver refuses the request (issues #1, #2).
   err=$("$NVSMI" -i "$idx" -lgc "$MIN_CLK","$IDLE_CAP" 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ]; then
+    # The request was recorded but its result is unknown (the driver may have
+    # applied it before failing): keep the marker and mark the GPU as a release
+    # target instead of returning to LOCKED=0 with no way back (#44).
+    UNVERIFIED[$idx]=1
     note_clamp_failure "$idx" "$trigger" "$rc" "" "$err"
     return 1
   fi
@@ -603,13 +645,14 @@ apply_clamp() { # index trigger was_mhz
   sleep "$SETTLE_S"
   observed=$(read_clock "$idx")
   if [ -z "$observed" ] || [ "$observed" -gt "$IDLE_CAP" ]; then
+    UNVERIFIED[$idx]=1
     note_clamp_failure "$idx" "$trigger" 0 "$observed" "$err"
     return 1
   fi
-  # The clamp is in effect: record it before anything else can fail, so a crash
-  # from here on still leaves a marker that --unlock and the next start can act
-  # on (#9, #20). Written on every verified clamp, a re-assert included.
-  mark_locked "$idx"
+  # The clamp is in effect and the marker (written above) is already there, so a
+  # crash from here on still leaves a record that --unlock and the next start
+  # can act on (#9, #20).
+  UNVERIFIED[$idx]=0
   if [ "$trigger" = "idle" ]; then
     CLAMP_FAIL[$idx]=0
     COOLDOWN_LOGGED[$idx]=0
@@ -632,6 +675,7 @@ unlock_gpu() { # index trigger [util_pct]
   local idx="$1" trigger="$2" util="${3:-}"
   if reset_clock "$idx"; then
     LOCKED[$idx]=0
+    UNVERIFIED[$idx]=0
     ASSERT_MS[$idx]=0
     REASSERT_FAIL[$idx]=0
     UNLOCK_FAIL[$idx]=0
@@ -666,7 +710,8 @@ unlock_all() { # trigger
   local g failed=0
   for g in "${GPU_IDS[@]}"; do
     if ! holds_lock "$g"; then continue; fi
-    if [ "${LOCKED[$g]:-0}" -ne 1 ] && [ ! -f "$(state_marker "$g")" ]; then
+    if [ "${LOCKED[$g]:-0}" -ne 1 ] && [ "${UNVERIFIED[$g]:-0}" -ne 1 ] \
+       && [ ! -f "$(state_marker "$g")" ]; then
       continue
     fi
     if ! unlock_gpu "$g" "$1" ""; then failed=1; fi
@@ -723,7 +768,15 @@ cleanup() { # status to preserve
     SLEEP_PID=""
   fi
   if [ -n "$STREAM_ERR" ] && [ "$STREAM_ERR" != "/dev/null" ]; then rm -f "$STREAM_ERR"; fi
-  if unlock_all exit; then unlocked=1; fi
+  # --keep-clocks (issue #48): the uninstaller creates this file before it stops
+  # the units. A release here would undo the request, so a stop leaves the
+  # clamp and the markers in place and still counts as a successful stop.
+  if keep_clocks; then
+    log info "clocks kept" "reason=\"keep-clocks\"" "gpu=$IDS"
+    unlocked=1
+  elif unlock_all exit; then
+    unlocked=1
+  fi
   if [ "$unlocked" -eq 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
   if [ "$unlocked" -eq 1 ]; then
     log info "exit" "gpu=$IDS" "rc=$rc"
@@ -802,13 +855,15 @@ trap 'cleanup 0' INT TERM
 #   level=info msg="started" gpu=.. min_mhz=.. cap_mhz=.. idle_s=.. sample_ms=..
 #     util_threshold_pct=.. reassert_s=.. skip_if_low=.. cooldown_s=..
 #     state_dir=.. nvidia_smi=..
+#   level=warn msg="started" ... unlock_pending=N   (a stale release failed, so
+#     the GPU stays a release target and is retried on activity/exit; #45)
 # Exit codes are part of the contract too: 0 clean stop, 1 runtime failure,
 # 2 invalid configuration, 3 the GPU is already managed by another instance
 # (logged as msg="gpu already managed", and nothing was touched).
 
 # --- startup: release only what a previous instance left behind (#20) ------
-# A marker exists only when a verified clamp was not released, i.e. the previous
-# instance crashed, was SIGKILLed or could not run its exit path.
+# A marker exists when a clamp (or a clamp attempt) was not released, i.e. the
+# previous instance crashed, was SIGKILLed or could not run its exit path.
 STALE=()
 for _g in "${GPU_IDS[@]}"; do
   if [ -f "$(state_marker "$_g")" ]; then STALE+=("$_g"); fi
@@ -817,18 +872,43 @@ unset _g
 if [ "${#STALE[@]}" -gt 0 ]; then
   log info "stale clamp markers found" "gpu=$(csv "${STALE[@]}")" \
     "state_dir=$STATE_DIR" "action=release"
+  # The marker proves that the previous instance clamped this GPU, so it is a
+  # release target until the reset is verified. Starting with LOCKED=0 would
+  # forget it the moment -rgc fails, and the GPU would never be retried when it
+  # is used again (issue #45).
+  for _g in "${STALE[@]}"; do LOCKED[$_g]=1; done
+  unset _g
 else
   log info "no stale clamp markers" "gpu=$IDS" "state_dir=$STATE_DIR"
 fi
 # -rgc only for marked GPUs: a fresh start must not reset a clock lock that
 # another tool set on a GPU this daemon never clamped (#20).
-unlock_all startup
+STARTUP_PENDING=()
+if ! unlock_all startup; then
+  for _g in "${STALE[@]+"${STALE[@]}"}"; do
+    if [ "${LOCKED[$_g]}" -eq 1 ]; then
+      STARTUP_PENDING+=("$_g")
+      # The failed release stays in LOCKED, so the activity and exit paths retry
+      # it. The start is not clean and must not be logged as if it were (#45).
+      log error "startup unlock failed" "gpu=$_g" "action=\"retry-on-activity\""
+    fi
+  done
+  unset _g
+fi
 
-log info "started" "gpu=$IDS" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP" \
-  "idle_s=$IDLE_SECONDS" "sample_ms=$SAMPLE_MS" \
-  "util_threshold_pct=$UTIL_THRESHOLD" "reassert_s=$REASSERT_SECONDS" \
-  "skip_if_low=$SKIP_IF_LOW" "cooldown_s=$COOLDOWN_SECONDS" \
+STARTED_FIELDS=(
+  "gpu=$IDS" "min_mhz=$MIN_CLK" "cap_mhz=$IDLE_CAP"
+  "idle_s=$IDLE_SECONDS" "sample_ms=$SAMPLE_MS"
+  "util_threshold_pct=$UTIL_THRESHOLD" "reassert_s=$REASSERT_SECONDS"
+  "skip_if_low=$SKIP_IF_LOW" "cooldown_s=$COOLDOWN_SECONDS"
   "state_dir=$STATE_DIR" "nvidia_smi=$NVSMI"
+)
+STARTED_LEVEL=info
+if [ "${#STARTUP_PENDING[@]}" -gt 0 ]; then
+  STARTED_LEVEL=warn
+  STARTED_FIELDS+=("unlock_pending=$(csv "${STARTUP_PENDING[@]}")")
+fi
+log "$STARTED_LEVEL" "started" "${STARTED_FIELDS[@]}"
 
 while :; do
   STREAM_SAMPLES=0
@@ -875,7 +955,11 @@ while :; do
         log warn "utilization unavailable" "gpu=$index" "raw=\"$(oneline "$line")\""
       fi
       IDLE_MS[$index]=0
-      if [ "${LOCKED[$index]}" -eq 1 ]; then unlock_gpu "$index" unavailable; fi
+      # A clamp whose result could not be verified is a "maybe locked" GPU too:
+      # an unreadable GPU is not an idle one (issues #8, #44).
+      if [ "${LOCKED[$index]}" -eq 1 ] || [ "${UNVERIFIED[$index]}" -eq 1 ]; then
+        unlock_gpu "$index" unavailable
+      fi
       continue
     fi
     UNKNOWN[$index]=0
@@ -886,8 +970,12 @@ while :; do
       CLAMP_FAIL[$index]=0
       RETRY_MS[$index]=0
       # A release is immediate and never delayed: a busy GPU must get its clocks
-      # back on the next sample, whatever the cooldown says (issue #18).
-      if [ "${LOCKED[$index]}" -eq 1 ]; then unlock_gpu "$index" util "$util"; fi
+      # back on the next sample, whatever the cooldown says (issue #18). A clamp
+      # that could not be verified is released here too: the activity is the
+      # evidence that the unknown lock must go (issue #44).
+      if [ "${LOCKED[$index]}" -eq 1 ] || [ "${UNVERIFIED[$index]}" -eq 1 ]; then
+        unlock_gpu "$index" util "$util"
+      fi
       continue
     fi
 
