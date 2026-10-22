@@ -3,13 +3,15 @@ Description=Idle clock clamp for NVIDIA GPU %i (idle power saving)
 Documentation=https://github.com/kuraneko1/nvidia-idle-clock
 Documentation=https://github.com/kuraneko1/nvidia-idle-clock/blob/main/README.md
 
-# Start only once the NVIDIA driver has created its control node. Without this
-# a boot can reach the unit before the driver is ready and every attempt fails
-# inside the script with "no valid GPU" (#11).
-# An unmet condition is a *skip*, not a failure, so if the feature seems to be
-# missing after a boot check:
-#   systemctl show nvidia-idle-clock@0.service -p ConditionResult
-ConditionPathExists=/dev/nvidiactl
+# No ConditionPathExists=/dev/nvidiactl here on purpose (#47). An unmet
+# condition does not fail the unit, it *skips* it - once and permanently.
+# Restart=on-failure never runs, the start-limit budget below is never entered,
+# and no path/device unit pulls the service in when the driver creates the node
+# later, so the power saving silently stays off for the rest of that boot.
+# The driver check therefore lives in ExecStartPre below, where a missing node
+# is an ordinary start failure that is logged and retried under the
+# 30 restarts / 600s budget (~300s at RestartSec=10s) - enough for a slow
+# driver. The cost is one journal entry per retry instead of a silent skip.
 
 # Lower parallelism with the driver stack. Both units are optional: where they
 # do not exist the ordering is simply ignored and nothing extra is pulled in.
@@ -54,6 +56,12 @@ Environment=IDLE_SECONDS=30
 # is now rejected too; reset the list in the same drop-in with a bare
 # "ExecStartPre=" if you rely on that.
 ExecStartPre=/bin/sh -c 'case "%i" in ""|*[!0-9]*) echo "nvidia-idle-clock: invalid GPU instance %i" >&2; exit 1;; esac'
+
+# Fail fast (and visibly) while the NVIDIA driver has not created its control
+# node yet. Unlike a condition this is retried by Restart=on-failure, see the
+# start-limit budget in [Unit]. Runs after the instance check so a permanent
+# configuration error is reported as such even while the device is missing.
+ExecStartPre=/usr/bin/test -e /dev/nvidiactl
 
 ExecStart=/usr/local/sbin/nvidia-idle-clock
 Restart=on-failure
