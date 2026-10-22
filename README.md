@@ -86,7 +86,7 @@ index を選べる (GPU UUID も可)。GPU ごとに `nvidia-idle-clock@<index>.
 
 ## 必要なもの
 
-- Linux + systemd (255 で検証、240 以降を想定)。Windows / macOS / WSL / systemd の無いコンテナは非対応
+- Linux + systemd (systemd 255 で検証。古い systemd では一部の sandbox 設定が無視され警告が出るが、動作は継続する)。Windows / macOS / WSL / systemd の無いコンテナは非対応
 - NVIDIA driver と `nvidia-smi`。`nvidia-smi -h` に `-lgc` があること
 - Volta 以降 (sm70)。検証済みは V100-PCIE-32GB と PG500-216 のみ → [対応ハードウェア](docs/reference.ja.md#対応ハードウェア)
 - bash 4.2+、coreutils、util-linux の `flock` (任意。無い場合は GPU 排他だけ無効)

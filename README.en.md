@@ -88,7 +88,7 @@ With no argument every detected GPU is used. Pick indices with `sudo ./install.s
 
 ## Requirements
 
-- Linux + systemd (tested on 255, expected 240+). Windows / macOS / WSL / containers without systemd are not supported
+- Linux + systemd (tested on 255; older systemd ignores some sandbox directives with a warning, the daemon still runs). Windows / macOS / WSL / containers without systemd are not supported
 - NVIDIA driver and `nvidia-smi`, with `-lgc` in `nvidia-smi -h`
 - Volta or newer (sm70); only V100-PCIE-32GB and PG500-216 are verified → [Supported hardware](docs/reference.en.md#supported-hardware)
 - bash 4.2+, coreutils, util-linux `flock` (optional; without it only the per-GPU exclusion is disabled)
