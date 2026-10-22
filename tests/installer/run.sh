@@ -439,7 +439,7 @@ assert_contains "$OUT" "usage:" "-h prints usage"
 reset_shim_log
 run_install --version
 assert_rc 0 "--version exits 0"
-assert_contains "$OUT" "installer 0.2.2" "--version prints the installer version"
+assert_contains "$OUT" "installer 0.2.3" "--version prints the installer version"
 assert_contains "$OUT" "daemon sha256=" "--version prints the daemon hash"
 assert_not_contains "$OUT" "sha256=unavailable" "--version finds the daemon"
 assert_not_contains "$(shim_log)" "systemctl enable" "--version does not touch systemd"
@@ -765,7 +765,7 @@ else
   assert_contains "$OUT" "backed up existing file" "existing daemon is backed up"
   assert_contains "$OUT" "restarted to load the new code" "already-active instance is restarted"
   assert_contains "$OUT" "install complete" "install reports completion"
-  assert_contains "$OUT" "version=0.2.2 sha256=" "install prints the installed version and hash"
+  assert_contains "$OUT" "version=0.2.3 sha256=" "install prints the installed version and hash"
   assert_equal "$(backup_count "$SB/usr_local_sbin")" "1" "exactly one daemon backup exists"
   assert_equal "$(first_line "$(backup_path "$SB/usr_local_sbin")")" "#!/bin/sh" "backup keeps the old content"
   assert_equal "$(first_line "$SB/usr_local_sbin/nvidia-idle-clock")" "#!/usr/bin/env bash" "new daemon is installed"

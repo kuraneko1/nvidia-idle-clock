@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-10-22
+
+Documentation release: bilingual figures. No code change.
+
+### Changed
+
+- The README and reference figures now come in Japanese (`img/ja/`) and English (`img/en/`)
+  variants, generated from one deterministic script (`docs/make-images.py`) with a per-language
+  string table; the Japanese set is rendered with Noto Sans CJK JP. Each README/reference links to
+  its own language's figures.
+- `img/hero.png`, `img/clamp-ladder.png`, `img/perf.png` and `img/timeline.png` moved to
+  `img/en/` (the English variants of the same figures).
+
 ## [0.2.2] - 2026-10-22
 
 Follow-up to the v0.2.1 release audit. The daemon's control loop is unchanged; these are
