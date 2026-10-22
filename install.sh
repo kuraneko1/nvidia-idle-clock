@@ -36,6 +36,7 @@ declare -a CREATED=()
 declare -a REPLACED=()
 declare -a ENABLED=()
 declare -a PRE_ACTIVE=()
+declare -a PRE_ENABLED=()
 
 # --- output ---------------------------------------------------------------
 # Stable key=value records, so logs stay greppable (see issue #31).
@@ -409,15 +410,53 @@ check_source_tree() {
   check_ancestors "$SELF_DIR"
 }
 
-# --- rollback (#13) -------------------------------------------------------
+# --- rollback (#13, #46) --------------------------------------------------
+# Only undo the unit changes this run actually made: a unit that was already
+# enabled before the run must stay enabled, and one that was already running
+# must be left running. Otherwise a failed ./install.sh on one GPU would stop
+# the healthy instance of another GPU.
 rollback() {
   local rc=$?
-  local unit entry dst backup
+  local unit entry dst backup was_enabled was_active
   trap - ERR INT TERM
   set +e
   error "msg=\"install failed, rolling back\" rc=$rc"
 
   for unit in ${ENABLED[@]+"${ENABLED[@]}"}; do
+    was_enabled=0
+    was_active=0
+    if in_list "$unit" ${PRE_ENABLED[@]+"${PRE_ENABLED[@]}"}; then
+      was_enabled=1
+    fi
+    if in_list "$unit" ${PRE_ACTIVE[@]+"${PRE_ACTIVE[@]}"}; then
+      was_active=1
+    fi
+
+    if [ "$was_enabled" -eq 1 ] && [ "$was_active" -eq 1 ]; then
+      warn "msg=\"left unit alone: it was already enabled and running before this run\" unit=\"$unit\""
+      continue
+    fi
+
+    if [ "$was_enabled" -eq 1 ]; then
+      # Started by this run but already enabled: stop it, keep it enabled.
+      if systemctl stop "$unit" >/dev/null 2>&1; then
+        warn "msg=\"stopped unit, left it enabled as before\" unit=\"$unit\""
+      else
+        error "msg=\"could not stop unit\" unit=\"$unit\" hint=\"systemctl stop $unit\""
+      fi
+      continue
+    fi
+
+    if [ "$was_active" -eq 1 ]; then
+      # Enabled by this run but already running: undo the enable, do not stop.
+      if systemctl disable "$unit" >/dev/null 2>&1; then
+        warn "msg=\"disabled unit, left the running instance alone\" unit=\"$unit\""
+      else
+        error "msg=\"could not disable unit\" unit=\"$unit\" hint=\"systemctl disable $unit\""
+      fi
+      continue
+    fi
+
     if systemctl disable --now "$unit" >/dev/null 2>&1; then
       warn "msg=\"rolled back unit\" unit=\"$unit\""
     else
@@ -535,16 +574,25 @@ daemon_reload() {
   info "msg=\"systemd reloaded\""
 }
 
-capture_active() {
+# Record the enabled and active state of every target unit before this run
+# changes anything. rollback() uses it to undo only what the run did (#46):
+# a pre-existing enabled+active instance must survive a failed install.
+capture_unit_state() {
   local gpu unit
   for gpu in ${GPUS[@]+"${GPUS[@]}"}; do
     unit="$(unit_name "$gpu")"
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
       PRE_ACTIVE+=("$unit")
     fi
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      PRE_ENABLED+=("$unit")
+    fi
   done
   if [ "${#PRE_ACTIVE[@]}" -gt 0 ]; then
     info "msg=\"instances already active before this run\" units=\"${PRE_ACTIVE[*]}\""
+  fi
+  if [ "${#PRE_ENABLED[@]}" -gt 0 ]; then
+    info "msg=\"instances already enabled before this run\" units=\"${PRE_ENABLED[*]}\""
   fi
 }
 
@@ -656,12 +704,14 @@ main() {
   # From here on the system is modified: a failure triggers rollback.
   trap 'rollback' ERR INT TERM
 
+  # Snapshot the unit state first (read-only), so rollback knows which units
+  # it may stop/disable and which ones were already running (#46).
+  capture_unit_state
   stage_file "$DAEMON_SRC" "$DAEMON_DST" 0755
   stage_file "$UNIT_SRC" "$UNIT_DST" 0644
   remove_legacy_unit
   daemon_reload
   verify_installed
-  capture_active
   enable_units
 
   # The installation itself is complete and consistent: stop undoing it. A

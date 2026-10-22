@@ -17,6 +17,14 @@ LEGACY_UNIT_NAME="nvidia-idle-clock.service"
 # for the template itself, plus one "*.service.d" per instance.
 UNIT_DIR="/etc/systemd/system"
 
+# Marker directory shared with the daemon (STATE_DIR, default
+# /run/nvidia-idle-clock). While "$STATE_DIR/keep-clocks" exists, the daemon's
+# shutdown path and the unit's ExecStopPost "--unlock" keep the clock clamp,
+# so --keep-clocks has to create it before the first unit is stopped (#48).
+STATE_DIR="${STATE_DIR:-/run/nvidia-idle-clock}"
+KEEP_CLOCKS_MARKER="$STATE_DIR/keep-clocks"
+MARKER_CREATED=0
+
 DRY_RUN=0
 KEEP_CLOCKS=0
 FAIL=0
@@ -40,8 +48,12 @@ options:
   -h, --help        show this help and exit
   -n, --dry-run     print every action without changing anything
                     (does not need root)
-      --keep-clocks do not touch the GPU clock locks (the units are removed,
-                    the current clock limit stays in place until reboot)
+      --keep-clocks keep the current GPU clock limit. A keep-clocks marker is
+                    written to $STATE_DIR before the instances are stopped, so
+                    both the daemon's shutdown and the unit's ExecStopPost
+                    "--unlock" leave the clamp in place. The limit survives
+                    until reboot; delete $STATE_DIR or run
+                    "sudo nvidia-smi -rgc" to release it earlier.
 EOF
 }
 
@@ -109,6 +121,53 @@ preflight() {
 }
 
 # --- steps ----------------------------------------------------------------
+# --keep-clocks (#48): the flag alone only skips release_clocks(), which runs
+# after the units are gone. Every stop releases the clamp from the daemon's
+# shutdown path and from ExecStopPost --unlock, so the marker has to exist
+# before the first stop. A failure removes it again, otherwise a later stop
+# would silently keep a clamp nobody asked to keep.
+prepare_keep_clocks() {
+  [ "$KEEP_CLOCKS" -eq 1 ] || return 0
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "msg=\"would create keep-clocks marker\"" "path=\"$KEEP_CLOCKS_MARKER\""
+    return 0
+  fi
+
+  if ! mkdir -p -- "$STATE_DIR"; then
+    die "could not create $STATE_DIR; the clock limit could not be kept, so the instances were left running (nothing was removed)"
+  fi
+  if ! chmod 0700 -- "$STATE_DIR"; then
+    die "could not set mode 0700 on $STATE_DIR; the instances were left running (nothing was removed)"
+  fi
+  # umask keeps the file private even if the chmod below never runs.
+  if ! ( umask 077 && : >"$KEEP_CLOCKS_MARKER" ); then
+    die "could not create $KEEP_CLOCKS_MARKER; the clock limit could not be kept, so the instances were left running (nothing was removed)"
+  fi
+  MARKER_CREATED=1
+  if ! chmod 0600 -- "$KEEP_CLOCKS_MARKER"; then
+    die "could not set mode 0600 on $KEEP_CLOCKS_MARKER; the instances were left running (nothing was removed)"
+  fi
+  info "msg=\"keep-clocks marker created\"" "path=\"$KEEP_CLOCKS_MARKER\"" \
+    "hint=\"the daemon and --unlock keep the clamp while this file exists\""
+}
+
+# EXIT trap: only a successful run may leave the marker behind.
+cleanup_keep_clocks_marker() {
+  local rc=$?
+  if [ "$MARKER_CREATED" -ne 1 ] || [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if rm -f -- "$KEEP_CLOCKS_MARKER"; then
+    warn "msg=\"removed the keep-clocks marker after a failed run\"" \
+      "path=\"$KEEP_CLOCKS_MARKER\"" "note=\"a later stop releases the clock limit as usual\""
+  else
+    error "msg=\"could not remove the keep-clocks marker after a failed run\"" \
+      "path=\"$KEEP_CLOCKS_MARKER\"" "hint=\"rm -f $KEEP_CLOCKS_MARKER\""
+  fi
+  return 0
+}
+
 stop_instances() {
   local list unit
   [ "$SYSTEMD_OK" -eq 1 ] || return 0
@@ -232,7 +291,8 @@ release_clocks() {
   local -a failed=() released=()
 
   if [ "$KEEP_CLOCKS" -eq 1 ]; then
-    info "msg=\"clock locks kept (--keep-clocks)\" hint=\"run: sudo nvidia-smi -i <N> -rgc\""
+    info "msg=\"clock locks kept (--keep-clocks)\"" \
+      "hint=\"kept until reboot: delete $STATE_DIR or run: sudo nvidia-smi -rgc\""
     return 0
   fi
 
@@ -315,6 +375,9 @@ main() {
   fi
   preflight
 
+  # Any non-zero exit (including the stop failure below) removes the marker.
+  trap cleanup_keep_clocks_marker EXIT
+  prepare_keep_clocks
   stop_instances
   stop_legacy_unit
   # Removing a unit file while its daemon is still running would leave the
@@ -341,7 +404,7 @@ main() {
   fi
 
   if [ "$KEEP_CLOCKS" -eq 1 ]; then
-    clock_note="clock locks kept by --keep-clocks"
+    clock_note="the GPU clock limit is kept until reboot"
   else
     clock_note="clock locks released"
   fi
@@ -349,6 +412,10 @@ main() {
     || warn 'msg="systemd was not running: unit state was not cleaned up"'
   info 'msg="uninstall complete"' "clocks=\"$clock_note\""
   printf 'uninstall complete: units removed, %s\n' "$clock_note"
+  if [ "$KEEP_CLOCKS" -eq 1 ]; then
+    printf 'release it earlier with: sudo nvidia-smi -rgc\n'
+    printf 'or delete the state directory %s (removes the marker)\n' "$STATE_DIR"
+  fi
 }
 
 main "$@"
