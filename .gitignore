@@ -20,6 +20,8 @@
 !/uninstall.sh
 !/nvidia-idle-clock
 !/nvidia-idle-clock@.service
+!/z170_guard_nvidia_smi.py
+!/test_z170_guard_nvidia_smi.py
 !/.github/
 !/tests/
 !/docs/
